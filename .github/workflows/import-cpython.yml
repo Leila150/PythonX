@@ -1,0 +1,66 @@
+name: Import Python source
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: "Python minor version to import (for example 3.14)"
+        required: true
+        type: string
+      source_tag:
+        description: "CPython tag (for example v3.14.0)"
+        required: true
+        type: string
+      target_branch:
+        description: "PythonX branch to populate (for example python-3.14)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download CPython source
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -eux
+          curl -L --fail --retry 3 "https://github.com/python/cpython/archive/refs/tags/${SOURCE_TAG}.tar.gz" -o cpython.tar.gz
+          tar -xzf cpython.tar.gz
+          SOURCE_DIR="cpython-${SOURCE_TAG#v}"
+          test -d "$SOURCE_DIR"
+          rm cpython.tar.gz
+
+      - name: Prepare repository
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -eux
+          SOURCE_DIR="cpython-${SOURCE_TAG#v}"
+          rm -rf .git .github
+          cp -a "$SOURCE_DIR"/. .
+          rm -rf "$SOURCE_DIR"
+          mkdir -p .github/workflows
+          printf '%s\n' "PythonX source base imported from CPython ${SOURCE_TAG}." > PYTHONX_SOURCE_BASE.txt
+
+      - name: Commit source to target branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PYTHON_VERSION: ${{ inputs.python_version }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -eux
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch origin "$TARGET_BRANCH"
+          git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
+          git add -A
+          git commit --allow-empty -m "Import Python ${PYTHON_VERSION} source from ${SOURCE_TAG}"
+          git push origin "HEAD:$TARGET_BRANCH"
