@@ -104,13 +104,12 @@ xcode_u64(XCode *x, uint64_t value)
 /*
  * Bootstrap machine-code emitter.
  *
- * The generated function has this ABI:
+ * Generated function ABI:
  *     PyObject *fn(void)
  *
- * The arithmetic is deliberately limited to signed machine-word integer
- * constants for now. Python's real numeric semantics will be implemented by
- * the PythonX native IR/runtime instead of pretending that a CPU integer is a
- * Python integer.
+ * The bootstrap arithmetic is intentionally limited to signed machine-word
+ * integer constants. Python's complete numeric/object semantics belong in the
+ * PythonX native IR/runtime and must not be faked with CPU integer operations.
  */
 
 static int
@@ -156,10 +155,8 @@ static int
 emit_mov_arg_from_rax(XCode *x)
 {
 #if defined(_WIN32)
-    /* Windows x64: first integer/pointer argument is RCX. */
     static const unsigned char op[] = {0x48, 0x89, 0xC1};
 #else
-    /* System V AMD64: first integer/pointer argument is RDI. */
     static const unsigned char op[] = {0x48, 0x89, 0xC7};
 #endif
     return xcode_bytes(x, op, sizeof(op));
@@ -179,28 +176,25 @@ emit_ret(XCode *x)
 }
 
 static int
-emit_windows_call_frame(XCode *x)
+emit_call_frame_enter(XCode *x)
 {
 #if defined(_WIN32)
-    /* Reserve the mandatory 32-byte Windows x64 shadow space. */
-    static const unsigned char op[] = {0x48, 0x83, 0xEC, 0x20};
-    return xcode_bytes(x, op, sizeof(op));
+    static const unsigned char op[] = {0x48, 0x83, 0xEC, 0x28};
 #else
-    (void)x;
-    return 0;
+    static const unsigned char op[] = {0x48, 0x83, 0xEC, 0x08};
 #endif
+    return xcode_bytes(x, op, sizeof(op));
 }
 
 static int
-emit_windows_call_frame_free(XCode *x)
+emit_call_frame_leave(XCode *x)
 {
 #if defined(_WIN32)
-    static const unsigned char op[] = {0x48, 0x83, 0xC4, 0x20};
-    return xcode_bytes(x, op, sizeof(op));
+    static const unsigned char op[] = {0x48, 0x83, 0xC4, 0x28};
 #else
-    (void)x;
-    return 0;
+    static const unsigned char op[] = {0x48, 0x83, 0xC4, 0x08};
 #endif
+    return xcode_bytes(x, op, sizeof(op));
 }
 
 static int
@@ -266,7 +260,6 @@ emit_expr(XCode *x, expr_ty node)
         case Mult:
             return emit_imul_rax_rcx(x);
         default:
-            /* Do not emit incorrect semantics for Python '/' or '//'. */
             PyErr_SetString(
                 PyExc_NotImplementedError,
                 "PythonX native bootstrap does not yet implement this binary operator");
@@ -347,12 +340,12 @@ _PyX_NativeCompile(mod_ty module, PyObject *filename)
         return NULL;
     }
 
-    /* Convert the native integer result into a Python object. */
+    /* RAX contains the native integer result. Turn it into a Python object. */
     if (emit_mov_arg_from_rax(&x) < 0 ||
-        emit_windows_call_frame(&x) < 0 ||
+        emit_call_frame_enter(&x) < 0 ||
         emit_mov_rax_imm64(&x, (uint64_t)(uintptr_t)&PyLong_FromLong) < 0 ||
         emit_call_rax(&x) < 0 ||
-        emit_windows_call_frame_free(&x) < 0 ||
+        emit_call_frame_leave(&x) < 0 ||
         emit_ret(&x) < 0) {
         xcode_free(&x);
         return NULL;
