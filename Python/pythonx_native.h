@@ -11,12 +11,13 @@ extern "C" {
 /*
  * PythonX native backend.
  *
- * This backend consumes Python's AST directly. It does not emit C, C++,
- * Rust, assembly source, Python bytecode, or another source language.
- * Its final output is target machine-code bytes held by a PyCapsule.
+ * Python source is parsed by Python's existing frontend. This backend consumes
+ * that AST and emits target machine-code bytes directly. It does not generate
+ * C, C++, Rust, assembly source, Python bytecode, or another source language.
  */
 
 PyAPI_FUNC(PyObject *) _PyX_NativeCompile(mod_ty module, PyObject *filename);
+PyAPI_FUNC(PyObject *) _PyX_NativeExecute(PyObject *native_code);
 
 #ifdef __cplusplus
 }
