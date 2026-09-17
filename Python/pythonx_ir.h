@@ -10,9 +10,14 @@ extern "C" {
 
 typedef enum {
     PYX_IR_CONST_INT = 1,
+    PYX_IR_CONST_OBJECT,
     PYX_IR_ADD,
     PYX_IR_SUB,
-    PYX_IR_MUL
+    PYX_IR_MUL,
+    PYX_IR_DIV,
+    PYX_IR_FLOORDIV,
+    PYX_IR_MOD,
+    PYX_IR_POW
 } PyXIROp;
 
 typedef struct PyXIRNode PyXIRNode;
@@ -20,6 +25,7 @@ typedef struct PyXIRNode PyXIRNode;
 struct PyXIRNode {
     PyXIROp op;
     int64_t value;
+    PyObject *object;
     PyXIRNode *left;
     PyXIRNode *right;
 };
