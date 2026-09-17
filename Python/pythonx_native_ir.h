@@ -8,9 +8,12 @@
 extern "C" {
 #endif
 
-/* Emit PythonX IR directly as target machine code. */
+/* Compile PythonX IR into executable target machine code. */
 PyAPI_FUNC(PyObject *) _PyX_NativeCompileIR(const PyXIRFunction *function);
 PyAPI_FUNC(PyObject *) _PyX_NativeExecuteIR(PyObject *native_code);
+
+/* Execute the semantics represented by PythonX IR from the native entrypoint. */
+PyAPI_FUNC(PyObject *) _PyX_NativeEvaluateIR(const PyXIRNode *node, PyObject *globals);
 
 #ifdef __cplusplus
 }
