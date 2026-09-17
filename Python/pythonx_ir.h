@@ -9,23 +9,22 @@ extern "C" {
 #endif
 
 typedef enum {
-    PYX_IR_CONST_INT = 1,
-    PYX_IR_CONST_OBJECT,
-    PYX_IR_ADD,
-    PYX_IR_SUB,
-    PYX_IR_MUL,
-    PYX_IR_DIV,
-    PYX_IR_FLOORDIV,
-    PYX_IR_MOD,
-    PYX_IR_POW
+    PYX_IR_CONST = 1,
+    PYX_IR_ADD, PYX_IR_SUB, PYX_IR_MUL, PYX_IR_MATMUL,
+    PYX_IR_DIV, PYX_IR_FLOORDIV, PYX_IR_MOD, PYX_IR_POW,
+    PYX_IR_LSHIFT, PYX_IR_RSHIFT, PYX_IR_BITOR, PYX_IR_BITXOR, PYX_IR_BITAND,
+    PYX_IR_INVERT, PYX_IR_POSITIVE, PYX_IR_NEGATIVE,
+    PYX_IR_NOT,
+    PYX_IR_LT, PYX_IR_LE, PYX_IR_EQ, PYX_IR_NE, PYX_IR_GT, PYX_IR_GE,
+    PYX_IR_IS, PYX_IR_IS_NOT, PYX_IR_IN, PYX_IR_NOT_IN,
+    PYX_IR_AND, PYX_IR_OR
 } PyXIROp;
 
 typedef struct PyXIRNode PyXIRNode;
 
 struct PyXIRNode {
     PyXIROp op;
-    int64_t value;
-    PyObject *object;
+    PyObject *constant;
     PyXIRNode *left;
     PyXIRNode *right;
 };
@@ -37,6 +36,7 @@ typedef struct {
 PyAPI_FUNC(void) _PyX_IR_Free(PyXIRFunction *function);
 PyAPI_FUNC(int) _PyX_IR_FromAST(mod_ty module, PyXIRFunction *function);
 PyAPI_FUNC(const char *) _PyX_IR_OpName(PyXIROp op);
+PyAPI_FUNC(PyObject *) _PyX_IR_Evaluate(const PyXIRNode *node);
 
 #ifdef __cplusplus
 }
