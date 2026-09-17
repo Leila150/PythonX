@@ -17,6 +17,7 @@ static void ir_free_node(PyXIRNode *node)
     if (node == NULL) return;
     ir_free_node(node->left);
     ir_free_node(node->right);
+    Py_XDECREF(node->object);
     PyMem_Free(node);
 }
 
@@ -27,25 +28,23 @@ void _PyX_IR_Free(PyXIRFunction *function)
     function->root = NULL;
 }
 
-static int constant_int(expr_ty expr, int64_t *value)
-{
-    if (expr->kind != Constant_kind || !PyLong_Check(expr->v.Constant.value)) return 0;
-    int overflow = 0;
-    long long converted = PyLong_AsLongLongAndOverflow(expr->v.Constant.value, &overflow);
-    if (converted == -1 && PyErr_Occurred()) return -1;
-    if (overflow != 0) return 0;
-    *value = (int64_t)converted;
-    return 1;
-}
-
 static PyXIRNode *lower_expr(expr_ty expr)
 {
-    int64_t value;
-    int result = constant_int(expr, &value);
-    if (result < 0) return NULL;
-    if (result) {
-        PyXIRNode *node = ir_new(PYX_IR_CONST_INT);
-        if (node != NULL) node->value = value;
+    if (expr->kind == Constant_kind) {
+        PyXIRNode *node = ir_new(PYX_IR_CONST_OBJECT);
+        if (node == NULL) return NULL;
+        node->object = Py_NewRef(expr->v.Constant.value);
+        if (PyLong_Check(node->object)) {
+            int overflow = 0;
+            long long converted = PyLong_AsLongLongAndOverflow(node->object, &overflow);
+            if (!PyErr_Occurred() && overflow == 0) {
+                node->op = PYX_IR_CONST_INT;
+                node->value = (int64_t)converted;
+            }
+            else {
+                PyErr_Clear();
+            }
+        }
         return node;
     }
 
@@ -60,6 +59,10 @@ static PyXIRNode *lower_expr(expr_ty expr)
         case Add: op = PYX_IR_ADD; break;
         case Sub: op = PYX_IR_SUB; break;
         case Mult: op = PYX_IR_MUL; break;
+        case Div: op = PYX_IR_DIV; break;
+        case FloorDiv: op = PYX_IR_FLOORDIV; break;
+        case Mod: op = PYX_IR_MOD; break;
+        case Pow: op = PYX_IR_POW; break;
         default:
             PyErr_Format(PyExc_NotImplementedError,
                          "PythonX IR: unsupported binary operator %d",
@@ -103,9 +106,14 @@ const char *_PyX_IR_OpName(PyXIROp op)
 {
     switch (op) {
         case PYX_IR_CONST_INT: return "const_int";
+        case PYX_IR_CONST_OBJECT: return "const_object";
         case PYX_IR_ADD: return "add";
         case PYX_IR_SUB: return "sub";
         case PYX_IR_MUL: return "mul";
+        case PYX_IR_DIV: return "div";
+        case PYX_IR_FLOORDIV: return "floordiv";
+        case PYX_IR_MOD: return "mod";
+        case PYX_IR_POW: return "pow";
         default: return "unknown";
     }
 }
