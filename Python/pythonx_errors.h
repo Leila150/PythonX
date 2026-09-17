@@ -7,30 +7,98 @@
 extern "C" {
 #endif
 
-/*
- * PythonX error runtime.
- *
- * PythonX deliberately uses Python's native exception objects and exception
- * state.  This is not a second error system: it exposes the machinery the
- * native backend needs while preserving Python's exception semantics.
- */
-
+/* PythonX uses Python's native exception and warning objects. */
 PyAPI_FUNC(int) _PyX_ErrorSet(PyObject *exception, PyObject *value);
 PyAPI_FUNC(int) _PyX_ErrorSetString(PyObject *exception, const char *message);
 PyAPI_FUNC(int) _PyX_ErrorFormat(PyObject *exception, const char *format, ...);
-
 PyAPI_FUNC(void) _PyX_ErrorFetch(PyObject **type, PyObject **value, PyObject **traceback);
 PyAPI_FUNC(void) _PyX_ErrorRestore(PyObject *type, PyObject *value, PyObject *traceback);
 PyAPI_FUNC(int) _PyX_ErrorMatches(PyObject *type, PyObject *exc);
 PyAPI_FUNC(int) _PyX_ErrorMatchesCurrent(PyObject *exc);
-
 PyAPI_FUNC(int) _PyX_ErrorNormalize(PyObject **type, PyObject **value, PyObject **traceback);
 PyAPI_FUNC(int) _PyX_ErrorAddTraceback(const char *funcname, const char *filename, int lineno);
 PyAPI_FUNC(void) _PyX_ErrorPrint(void);
-
-/* Raise an exception while preserving an existing active exception as its
- * context, matching Python's exception-chaining model. */
 PyAPI_FUNC(int) _PyX_ErrorRaiseWithContext(PyObject *exception, PyObject *value);
+
+/*
+ * Catalog of Python's existing exception and warning objects.
+ * These IDs never create new exception classes. Compatibility aliases return
+ * the same canonical object and therefore are not independent classes.
+ */
+typedef enum {
+    PYX_ERROR_BASEEXCEPTION,
+    PYX_ERROR_EXCEPTION,
+    PYX_ERROR_ARITHMETICERROR,
+    PYX_ERROR_BUFFERERROR,
+    PYX_ERROR_LOOKUPERROR,
+    PYX_ERROR_ASSERTIONERROR,
+    PYX_ERROR_ATTRIBUTEERROR,
+    PYX_ERROR_EOFERROR,
+    PYX_ERROR_FLOATINGPOINTERROR,
+    PYX_ERROR_GENERATOREXIT,
+    PYX_ERROR_IMPORTERROR,
+    PYX_ERROR_MODULENOTFOUNDERROR,
+    PYX_ERROR_INDEXERROR,
+    PYX_ERROR_KEYERROR,
+    PYX_ERROR_KEYBOARDINTERRUPT,
+    PYX_ERROR_MEMORYERROR,
+    PYX_ERROR_NAMEERROR,
+    PYX_ERROR_NOTIMPLEMENTEDERROR,
+    PYX_ERROR_OSERROR,
+    PYX_ERROR_CONNECTIONERROR,
+    PYX_ERROR_BROKENPIPEERROR,
+    PYX_ERROR_CONNECTIONABORTEDERROR,
+    PYX_ERROR_CONNECTIONREFUSEDERROR,
+    PYX_ERROR_CONNECTIONRESETERROR,
+    PYX_ERROR_FILEEXISTSERROR,
+    PYX_ERROR_FILENOTFOUNDERROR,
+    PYX_ERROR_INTERRUPTEDERROR,
+    PYX_ERROR_ISADIRECTORYERROR,
+    PYX_ERROR_NOTADIRECTORYERROR,
+    PYX_ERROR_PERMISSIONERROR,
+    PYX_ERROR_PROCESSLOOKUPERROR,
+    PYX_ERROR_TIMEOUTERROR,
+    PYX_ERROR_OVERFLOWERROR,
+    PYX_ERROR_REFERENCEERROR,
+    PYX_ERROR_RUNTIMEERROR,
+    PYX_ERROR_STOPITERATION,
+    PYX_ERROR_STOPASYNCIERATION,
+    PYX_ERROR_SYNTAXERROR,
+    PYX_ERROR_INDENTATIONERROR,
+    PYX_ERROR_TABERROR,
+    PYX_ERROR_SYSTEMERROR,
+    PYX_ERROR_SYSTEMEXIT,
+    PYX_ERROR_TYPEERROR,
+    PYX_ERROR_UNBOUNDLOCALERROR,
+    PYX_ERROR_UNICODEERROR,
+    PYX_ERROR_UNICODEENCODEERROR,
+    PYX_ERROR_UNICODEDECODEERROR,
+    PYX_ERROR_UNICODETRANSLATEERROR,
+    PYX_ERROR_VALUEERROR,
+    PYX_ERROR_ZERODIVISIONERROR,
+    PYX_ERROR_WARNING,
+    PYX_ERROR_USERWARNING,
+    PYX_ERROR_DEPRECATIONWARNING,
+    PYX_ERROR_PENDINGDEPRECATIONWARNING,
+    PYX_ERROR_SYNTAXWARNING,
+    PYX_ERROR_RUNTIMEWARNING,
+    PYX_ERROR_FUTUREWARNING,
+    PYX_ERROR_IMPORTWARNING,
+    PYX_ERROR_UNICODEWARNING,
+    PYX_ERROR_BYTESWARNING,
+    PYX_ERROR_ENCODINGWARNING,
+    PYX_ERROR_RESOURCEWARNING,
+    PYX_ERROR_EXCEPTIONGROUP,
+    PYX_ERROR_BASEEXCEPTIONGROUP,
+    PYX_ERROR_ENVIRONMENTERROR,
+    PYX_ERROR_IOERROR,
+    PYX_ERROR_WINDOWSERror,
+    PYX_ERROR_COUNT
+} PyXErrorId;
+
+PyAPI_FUNC(PyObject *) _PyX_ErrorType(PyXErrorId id);
+PyAPI_FUNC(const char *) _PyX_ErrorTypeName(PyXErrorId id);
+PyAPI_FUNC(int) _PyX_ErrorTypeIsAlias(PyXErrorId id);
 
 #ifdef __cplusplus
 }
