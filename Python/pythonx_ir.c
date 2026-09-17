@@ -64,7 +64,7 @@ static PyXIRNode *lower_dict(expr_ty expr)
     if (ir_set_children(node, count * 2) < 0) { ir_free_node(node); return NULL; }
     for (Py_ssize_t i = 0; i < count; i++) {
         expr_ty key = (expr_ty)asdl_seq_GET(keys, i);
-        if (key == NULL) {
+        if (!key) {
             PyErr_SetString(PyExc_NotImplementedError, "PythonX: dictionary unpacking is not yet lowered");
             ir_free_node(node); return NULL;
         }
@@ -84,6 +84,55 @@ static PyXIRNode *lower_name(expr_ty expr, PyXIROp op)
     return node;
 }
 
+static PyXIRNode *lower_none_constant(void)
+{
+    PyXIRNode *node = ir_new(PYX_IR_CONST);
+    if (!node) return NULL;
+    node->constant = Py_NewRef(Py_None);
+    return node;
+}
+
+static PyXIRNode *lower_slice(expr_ty expr)
+{
+    PyXIRNode *node = ir_new(PYX_IR_SEQUENCE);
+    if (!node) return NULL;
+    if (ir_set_children(node, 4) < 0) { ir_free_node(node); return NULL; }
+    node->children[0] = ir_new(PYX_IR_CONST);
+    if (!node->children[0]) { ir_free_node(node); return NULL; }
+    node->children[0]->constant = PyUnicode_FromString("__pythonx_slice__");
+    node->children[1] = expr->v.Slice.lower ? lower_expr(expr->v.Slice.lower) : lower_none_constant();
+    node->children[2] = expr->v.Slice.upper ? lower_expr(expr->v.Slice.upper) : lower_none_constant();
+    node->children[3] = expr->v.Slice.step ? lower_expr(expr->v.Slice.step) : lower_none_constant();
+    if (!node->children[0]->constant || !node->children[1] || !node->children[2] || !node->children[3]) {
+        ir_free_node(node); return NULL;
+    }
+    return node;
+}
+
+static PyXIRNode *lower_subscript(expr_ty expr)
+{
+    PyXIRNode *node = ir_new(PYX_IR_SUBSCRIPT);
+    if (!node) return NULL;
+    if (ir_set_children(node, 2) < 0) { ir_free_node(node); return NULL; }
+    node->children[0] = lower_expr(expr->v.Subscript.value);
+    node->children[1] = expr->v.Subscript.slice->kind == Slice_kind
+        ? lower_slice(expr->v.Subscript.slice)
+        : lower_expr(expr->v.Subscript.slice);
+    if (!node->children[0] || !node->children[1]) { ir_free_node(node); return NULL; }
+    return node;
+}
+
+static PyXIRNode *lower_attribute(expr_ty expr)
+{
+    PyXIRNode *node = ir_new(PYX_IR_GETATTR);
+    if (!node) return NULL;
+    node->constant = PyUnicode_FromString(expr->v.Attribute.attr);
+    if (!node->constant) { ir_free_node(node); return NULL; }
+    node->left = lower_expr(expr->v.Attribute.value);
+    if (!node->left) { ir_free_node(node); return NULL; }
+    return node;
+}
+
 static PyXIRNode *lower_expr(expr_ty expr)
 {
     switch (expr->kind) {
@@ -93,12 +142,14 @@ static PyXIRNode *lower_expr(expr_ty expr)
             node->constant = Py_NewRef(expr->v.Constant.value);
             return node;
         }
-        case Name_kind:
-            return lower_name(expr, PYX_IR_NAME_LOAD);
+        case Name_kind: return lower_name(expr, PYX_IR_NAME_LOAD);
         case List_kind: return lower_sequence(PYX_IR_LIST, expr->v.List.elts);
         case Tuple_kind: return lower_sequence(PYX_IR_TUPLE, expr->v.Tuple.elts);
         case Set_kind: return lower_sequence(PYX_IR_SET, expr->v.Set.elts);
         case Dict_kind: return lower_dict(expr);
+        case Attribute_kind: return lower_attribute(expr);
+        case Subscript_kind: return lower_subscript(expr);
+        case Slice_kind: return lower_slice(expr);
         case UnaryOp_kind: {
             PyXIROp op;
             switch (expr->v.UnaryOp.op) {
@@ -117,12 +168,18 @@ static PyXIRNode *lower_expr(expr_ty expr)
         case BinOp_kind: {
             PyXIROp op;
             switch (expr->v.BinOp.op) {
-                case Add: op = PYX_IR_ADD; break; case Sub: op = PYX_IR_SUB; break;
-                case Mult: op = PYX_IR_MUL; break; case MatMult: op = PYX_IR_MATMUL; break;
-                case Div: op = PYX_IR_DIV; break; case FloorDiv: op = PYX_IR_FLOORDIV; break;
-                case Mod: op = PYX_IR_MOD; break; case Pow: op = PYX_IR_POW; break;
-                case LShift: op = PYX_IR_LSHIFT; break; case RShift: op = PYX_IR_RSHIFT; break;
-                case BitOr: op = PYX_IR_BITOR; break; case BitXor: op = PYX_IR_BITXOR; break;
+                case Add: op = PYX_IR_ADD; break;
+                case Sub: op = PYX_IR_SUB; break;
+                case Mult: op = PYX_IR_MUL; break;
+                case MatMult: op = PYX_IR_MATMUL; break;
+                case Div: op = PYX_IR_DIV; break;
+                case FloorDiv: op = PYX_IR_FLOORDIV; break;
+                case Mod: op = PYX_IR_MOD; break;
+                case Pow: op = PYX_IR_POW; break;
+                case LShift: op = PYX_IR_LSHIFT; break;
+                case RShift: op = PYX_IR_RSHIFT; break;
+                case BitOr: op = PYX_IR_BITOR; break;
+                case BitXor: op = PYX_IR_BITXOR; break;
                 case BitAnd: op = PYX_IR_BITAND; break;
                 default: PyErr_SetString(PyExc_NotImplementedError, "unsupported binary operator"); return NULL;
             }
@@ -144,7 +201,9 @@ static PyXIRNode *lower_expr(expr_ty expr)
                 if (!item) { ir_free_node(root); return NULL; }
                 PyXIRNode *join = ir_new(op);
                 if (!join) { ir_free_node(item); ir_free_node(root); return NULL; }
-                join->left = root; join->right = item; root = join;
+                join->left = root;
+                join->right = item;
+                root = join;
             }
             return root;
         }
@@ -154,11 +213,16 @@ static PyXIRNode *lower_expr(expr_ty expr)
             }
             PyXIROp op;
             switch ((cmpop_ty)asdl_seq_GET(expr->v.Compare.ops, 0)) {
-                case Lt: op = PYX_IR_LT; break; case LtE: op = PYX_IR_LE; break;
-                case Eq: op = PYX_IR_EQ; break; case NotEq: op = PYX_IR_NE; break;
-                case Gt: op = PYX_IR_GT; break; case GtE: op = PYX_IR_GE; break;
-                case Is: op = PYX_IR_IS; break; case IsNot: op = PYX_IR_IS_NOT; break;
-                case In: op = PYX_IR_IN; break; case NotIn: op = PYX_IR_NOT_IN; break;
+                case Lt: op = PYX_IR_LT; break;
+                case LtE: op = PYX_IR_LE; break;
+                case Eq: op = PYX_IR_EQ; break;
+                case NotEq: op = PYX_IR_NE; break;
+                case Gt: op = PYX_IR_GT; break;
+                case GtE: op = PYX_IR_GE; break;
+                case Is: op = PYX_IR_IS; break;
+                case IsNot: op = PYX_IR_IS_NOT; break;
+                case In: op = PYX_IR_IN; break;
+                case NotIn: op = PYX_IR_NOT_IN; break;
                 default: PyErr_SetString(PyExc_NotImplementedError, "unsupported comparison"); return NULL;
             }
             PyXIRNode *node = ir_new(op);
@@ -174,43 +238,62 @@ static PyXIRNode *lower_expr(expr_ty expr)
     }
 }
 
-static PyXIRNode *lower_store_name(expr_ty target, expr_ty value)
+static PyXIRNode *lower_store(expr_ty target, expr_ty value)
 {
-    if (target->kind != Name_kind) {
-        PyErr_SetString(PyExc_NotImplementedError, "PythonX: only simple name assignment is currently supported");
-        return NULL;
+    if (target->kind == Name_kind) {
+        PyXIRNode *node = lower_name(target, PYX_IR_NAME_STORE);
+        if (!node) return NULL;
+        node->left = lower_expr(value);
+        if (!node->left) { ir_free_node(node); return NULL; }
+        return node;
     }
-    PyXIRNode *node = lower_name(target, PYX_IR_NAME_STORE);
-    if (!node) return NULL;
-    node->left = lower_expr(value);
-    if (!node->left) { ir_free_node(node); return NULL; }
-    return node;
+    if (target->kind == Subscript_kind) {
+        PyXIRNode *node = ir_new(PYX_IR_SUBSCRIPT_STORE);
+        if (!node) return NULL;
+        if (ir_set_children(node, 3) < 0) { ir_free_node(node); return NULL; }
+        node->children[0] = lower_expr(target->v.Subscript.value);
+        node->children[1] = target->v.Subscript.slice->kind == Slice_kind
+            ? lower_slice(target->v.Subscript.slice)
+            : lower_expr(target->v.Subscript.slice);
+        node->children[2] = lower_expr(value);
+        if (!node->children[0] || !node->children[1] || !node->children[2]) { ir_free_node(node); return NULL; }
+        return node;
+    }
+    if (target->kind == Attribute_kind) {
+        PyXIRNode *node = ir_new(PYX_IR_SETATTR);
+        if (!node) return NULL;
+        node->constant = PyUnicode_FromString(target->v.Attribute.attr);
+        if (!node->constant) { ir_free_node(node); return NULL; }
+        node->left = lower_expr(target->v.Attribute.value);
+        node->right = lower_expr(value);
+        if (!node->left || !node->right) { ir_free_node(node); return NULL; }
+        return node;
+    }
+    PyErr_SetString(PyExc_NotImplementedError, "PythonX: unsupported assignment target");
+    return NULL;
 }
 
 static PyXIRNode *lower_statement(stmt_ty statement)
 {
     if (statement->kind == Expr_kind) return lower_expr(statement->v.Expr.value);
-
     if (statement->kind == Assign_kind) {
         Py_ssize_t count = asdl_seq_LEN(statement->v.Assign.targets);
         PyXIRNode *sequence = ir_new(PYX_IR_SEQUENCE);
         if (!sequence) return NULL;
         if (ir_set_children(sequence, count) < 0) { ir_free_node(sequence); return NULL; }
         for (Py_ssize_t i = 0; i < count; i++) {
-            sequence->children[i] = lower_store_name((expr_ty)asdl_seq_GET(statement->v.Assign.targets, i), statement->v.Assign.value);
+            sequence->children[i] = lower_store((expr_ty)asdl_seq_GET(statement->v.Assign.targets, i), statement->v.Assign.value);
             if (!sequence->children[i]) { ir_free_node(sequence); return NULL; }
         }
         return sequence;
     }
-
     if (statement->kind == AnnAssign_kind) {
         if (!statement->v.AnnAssign.value) {
             PyErr_SetString(PyExc_NotImplementedError, "PythonX: annotated declarations without a value are not yet supported");
             return NULL;
         }
-        return lower_store_name(statement->v.AnnAssign.target, statement->v.AnnAssign.value);
+        return lower_store(statement->v.AnnAssign.target, statement->v.AnnAssign.value);
     }
-
     PyErr_Format(PyExc_NotImplementedError, "PythonX IR: unsupported statement kind %d", (int)statement->kind);
     return NULL;
 }
@@ -223,7 +306,6 @@ int _PyX_IR_FromAST(mod_ty module, PyXIRFunction *function)
         PyErr_SetString(PyExc_NotImplementedError, "PythonX requires a non-empty module during bootstrap");
         return -1;
     }
-
     Py_ssize_t count = asdl_seq_LEN(module->v.Module.body);
     PyXIRNode *root = ir_new(PYX_IR_SEQUENCE);
     if (!root) return -1;
@@ -239,20 +321,70 @@ int _PyX_IR_FromAST(mod_ty module, PyXIRFunction *function)
 const char *_PyX_IR_OpName(PyXIROp op)
 {
     switch (op) {
-        case PYX_IR_CONST: return "const"; case PYX_IR_LIST: return "list";
-        case PYX_IR_TUPLE: return "tuple"; case PYX_IR_SET: return "set"; case PYX_IR_DICT: return "dict";
-        case PYX_IR_NAME_LOAD: return "name_load"; case PYX_IR_NAME_STORE: return "name_store"; case PYX_IR_SEQUENCE: return "sequence";
-        case PYX_IR_ADD: return "add"; case PYX_IR_SUB: return "sub"; case PYX_IR_MUL: return "mul";
-        case PYX_IR_MATMUL: return "matmul"; case PYX_IR_DIV: return "div"; case PYX_IR_FLOORDIV: return "floordiv";
-        case PYX_IR_MOD: return "mod"; case PYX_IR_POW: return "pow"; case PYX_IR_LSHIFT: return "lshift";
-        case PYX_IR_RSHIFT: return "rshift"; case PYX_IR_BITOR: return "bitor"; case PYX_IR_BITXOR: return "bitxor";
-        case PYX_IR_BITAND: return "bitand"; case PYX_IR_INVERT: return "invert"; case PYX_IR_POSITIVE: return "positive";
-        case PYX_IR_NEGATIVE: return "negative"; case PYX_IR_NOT: return "not"; case PYX_IR_LT: return "lt";
-        case PYX_IR_LE: return "le"; case PYX_IR_EQ: return "eq"; case PYX_IR_NE: return "ne"; case PYX_IR_GT: return "gt";
-        case PYX_IR_GE: return "ge"; case PYX_IR_IS: return "is"; case PYX_IR_IS_NOT: return "is_not";
-        case PYX_IR_IN: return "in"; case PYX_IR_NOT_IN: return "not_in"; case PYX_IR_AND: return "and"; case PYX_IR_OR: return "or";
+        case PYX_IR_CONST: return "const";
+        case PYX_IR_LIST: return "list";
+        case PYX_IR_TUPLE: return "tuple";
+        case PYX_IR_SET: return "set";
+        case PYX_IR_DICT: return "dict";
+        case PYX_IR_NAME_LOAD: return "name_load";
+        case PYX_IR_NAME_STORE: return "name_store";
+        case PYX_IR_SEQUENCE: return "sequence";
+        case PYX_IR_SUBSCRIPT: return "subscript";
+        case PYX_IR_SUBSCRIPT_STORE: return "subscript_store";
+        case PYX_IR_GETATTR: return "getattr";
+        case PYX_IR_SETATTR: return "setattr";
+        case PYX_IR_ADD: return "add";
+        case PYX_IR_SUB: return "sub";
+        case PYX_IR_MUL: return "mul";
+        case PYX_IR_MATMUL: return "matmul";
+        case PYX_IR_DIV: return "div";
+        case PYX_IR_FLOORDIV: return "floordiv";
+        case PYX_IR_MOD: return "mod";
+        case PYX_IR_POW: return "pow";
+        case PYX_IR_LSHIFT: return "lshift";
+        case PYX_IR_RSHIFT: return "rshift";
+        case PYX_IR_BITOR: return "bitor";
+        case PYX_IR_BITXOR: return "bitxor";
+        case PYX_IR_BITAND: return "bitand";
+        case PYX_IR_INVERT: return "invert";
+        case PYX_IR_POSITIVE: return "positive";
+        case PYX_IR_NEGATIVE: return "negative";
+        case PYX_IR_NOT: return "not";
+        case PYX_IR_LT: return "lt";
+        case PYX_IR_LE: return "le";
+        case PYX_IR_EQ: return "eq";
+        case PYX_IR_NE: return "ne";
+        case PYX_IR_GT: return "gt";
+        case PYX_IR_GE: return "ge";
+        case PYX_IR_IS: return "is";
+        case PYX_IR_IS_NOT: return "is_not";
+        case PYX_IR_IN: return "in";
+        case PYX_IR_NOT_IN: return "not_in";
+        case PYX_IR_AND: return "and";
+        case PYX_IR_OR: return "or";
         default: return "unknown";
     }
+}
+
+static PyObject *eval_node(const PyXIRNode *node, PyObject *globals);
+
+static int is_slice_node(const PyXIRNode *node)
+{
+    return node && node->op == PYX_IR_SEQUENCE && node->child_count == 4 &&
+           node->children[0]->op == PYX_IR_CONST &&
+           PyUnicode_Check(node->children[0]->constant) &&
+           PyUnicode_CompareWithASCIIString(node->children[0]->constant, "__pythonx_slice__") == 0;
+}
+
+static PyObject *eval_slice(const PyXIRNode *node, PyObject *globals)
+{
+    PyObject *lower = eval_node(node->children[1], globals);
+    PyObject *upper = eval_node(node->children[2], globals);
+    PyObject *step = eval_node(node->children[3], globals);
+    if (!lower || !upper || !step) { Py_XDECREF(lower); Py_XDECREF(upper); Py_XDECREF(step); return NULL; }
+    PyObject *result = PySlice_New(lower, upper, step);
+    Py_DECREF(lower); Py_DECREF(upper); Py_DECREF(step);
+    return result;
 }
 
 static PyObject *eval_node(const PyXIRNode *node, PyObject *globals)
@@ -272,8 +404,47 @@ static PyObject *eval_node(const PyXIRNode *node, PyObject *globals)
     if (node->op == PYX_IR_NAME_STORE) {
         PyObject *value = eval_node(node->left, globals);
         if (!value) return NULL;
-        if (PyDict_SetItem(globals, node->constant, value) < 0) { Py_DECREF(value); return NULL; }
+        int rc = PyDict_SetItem(globals, node->constant, value);
         Py_DECREF(value);
+        if (rc < 0) return NULL;
+        Py_RETURN_NONE;
+    }
+
+    if (node->op == PYX_IR_GETATTR) {
+        PyObject *object = eval_node(node->left, globals);
+        if (!object) return NULL;
+        PyObject *result = PyObject_GetAttr(object, node->constant);
+        Py_DECREF(object);
+        return result;
+    }
+
+    if (node->op == PYX_IR_SETATTR) {
+        PyObject *object = eval_node(node->left, globals);
+        PyObject *value = eval_node(node->right, globals);
+        if (!object || !value) { Py_XDECREF(object); Py_XDECREF(value); return NULL; }
+        int rc = PyObject_SetAttr(object, node->constant, value);
+        Py_DECREF(object); Py_DECREF(value);
+        if (rc < 0) return NULL;
+        Py_RETURN_NONE;
+    }
+
+    if (node->op == PYX_IR_SUBSCRIPT || node->op == PYX_IR_SUBSCRIPT_STORE) {
+        PyObject *object = eval_node(node->children[0], globals);
+        if (!object) return NULL;
+        PyObject *key = is_slice_node(node->children[1])
+            ? eval_slice(node->children[1], globals)
+            : eval_node(node->children[1], globals);
+        if (!key) { Py_DECREF(object); return NULL; }
+        if (node->op == PYX_IR_SUBSCRIPT) {
+            PyObject *result = PyObject_GetItem(object, key);
+            Py_DECREF(object); Py_DECREF(key);
+            return result;
+        }
+        PyObject *value = eval_node(node->children[2], globals);
+        if (!value) { Py_DECREF(object); Py_DECREF(key); return NULL; }
+        int rc = PyObject_SetItem(object, key, value);
+        Py_DECREF(object); Py_DECREF(key); Py_DECREF(value);
+        if (rc < 0) return NULL;
         Py_RETURN_NONE;
     }
 
@@ -297,7 +468,8 @@ static PyObject *eval_node(const PyXIRNode *node, PyObject *globals)
             if (node->op == PYX_IR_LIST) PyList_SET_ITEM(result, i, item);
             else if (node->op == PYX_IR_TUPLE) PyTuple_SET_ITEM(result, i, item);
             else {
-                int rc = PySet_Add(result, item); Py_DECREF(item);
+                int rc = PySet_Add(result, item);
+                Py_DECREF(item);
                 if (rc < 0) { Py_DECREF(result); return NULL; }
             }
         }
@@ -318,46 +490,72 @@ static PyObject *eval_node(const PyXIRNode *node, PyObject *globals)
         return result;
     }
 
-    if (node->op == PYX_IR_AND || node->op == PYX_IR_OR) {
-        PyObject *left = eval_node(node->left, globals);
-        if (!left) return NULL;
-        int truth = PyObject_IsTrue(left);
-        if (truth < 0) { Py_DECREF(left); return NULL; }
-        if ((node->op == PYX_IR_AND && !truth) || (node->op == PYX_IR_OR && truth)) return left;
-        Py_DECREF(left);
-        return eval_node(node->right, globals);
+    if (node->op == PYX_IR_NOT || node->op == PYX_IR_INVERT || node->op == PYX_IR_POSITIVE || node->op == PYX_IR_NEGATIVE) {
+        PyObject *value = eval_node(node->left, globals);
+        if (!value) return NULL;
+        PyObject *result = NULL;
+        if (node->op == PYX_IR_NOT) {
+            int truth = PyObject_IsTrue(value);
+            if (truth < 0) { Py_DECREF(value); return NULL; }
+            result = PyBool_FromLong(!truth);
+        } else if (node->op == PYX_IR_INVERT) result = PyNumber_Invert(value);
+        else if (node->op == PYX_IR_POSITIVE) result = PyNumber_Positive(value);
+        else result = PyNumber_Negative(value);
+        Py_DECREF(value);
+        return result;
     }
 
-    PyObject *a = eval_node(node->left, globals);
-    if (!a) return NULL;
-    PyObject *b = node->right ? eval_node(node->right, globals) : NULL;
-    if (node->right && !b) { Py_DECREF(a); return NULL; }
-    PyObject *r = NULL;
-    switch (node->op) {
-        case PYX_IR_ADD: r = PyNumber_Add(a, b); break; case PYX_IR_SUB: r = PyNumber_Subtract(a, b); break;
-        case PYX_IR_MUL: r = PyNumber_Multiply(a, b); break; case PYX_IR_MATMUL: r = PyNumber_MatrixMultiply(a, b); break;
-        case PYX_IR_DIV: r = PyNumber_TrueDivide(a, b); break; case PYX_IR_FLOORDIV: r = PyNumber_FloorDivide(a, b); break;
-        case PYX_IR_MOD: r = PyNumber_Remainder(a, b); break; case PYX_IR_POW: r = PyNumber_Power(a, b, Py_None); break;
-        case PYX_IR_LSHIFT: r = PyNumber_Lshift(a, b); break; case PYX_IR_RSHIFT: r = PyNumber_Rshift(a, b); break;
-        case PYX_IR_BITOR: r = PyNumber_Or(a, b); break; case PYX_IR_BITXOR: r = PyNumber_Xor(a, b); break; case PYX_IR_BITAND: r = PyNumber_And(a, b); break;
-        case PYX_IR_INVERT: r = PyNumber_Invert(a); break; case PYX_IR_POSITIVE: r = PyNumber_Positive(a); break; case PYX_IR_NEGATIVE: r = PyNumber_Negative(a); break;
-        case PYX_IR_NOT: { int t = PyObject_IsTrue(a); if (t >= 0) r = PyBool_FromLong(!t); break; }
-        case PYX_IR_LT: r = PyObject_RichCompare(a, b, Py_LT); break; case PYX_IR_LE: r = PyObject_RichCompare(a, b, Py_LE); break;
-        case PYX_IR_EQ: r = PyObject_RichCompare(a, b, Py_EQ); break; case PYX_IR_NE: r = PyObject_RichCompare(a, b, Py_NE); break;
-        case PYX_IR_GT: r = PyObject_RichCompare(a, b, Py_GT); break; case PYX_IR_GE: r = PyObject_RichCompare(a, b, Py_GE); break;
-        case PYX_IR_IS: r = PyBool_FromLong(a == b); break; case PYX_IR_IS_NOT: r = PyBool_FromLong(a != b); break;
-        case PYX_IR_IN: { int t = PySequence_Contains(b, a); if (t >= 0) r = PyBool_FromLong(t); break; }
-        case PYX_IR_NOT_IN: { int t = PySequence_Contains(b, a); if (t >= 0) r = PyBool_FromLong(!t); break; }
-        default: PyErr_SetString(PyExc_NotImplementedError, "unsupported PythonX IR operation"); break;
+    if (node->op >= PYX_IR_ADD && node->op <= PYX_IR_OR) {
+        PyObject *left = eval_node(node->left, globals);
+        if (!left) return NULL;
+        if (node->op == PYX_IR_AND || node->op == PYX_IR_OR) {
+            int truth = PyObject_IsTrue(left);
+            if (truth < 0) { Py_DECREF(left); return NULL; }
+            if ((node->op == PYX_IR_AND && !truth) || (node->op == PYX_IR_OR && truth)) return left;
+        }
+        PyObject *right = eval_node(node->right, globals);
+        if (!right) { Py_DECREF(left); return NULL; }
+        PyObject *result = NULL;
+        switch (node->op) {
+            case PYX_IR_ADD: result = PyNumber_Add(left, right); break;
+            case PYX_IR_SUB: result = PyNumber_Subtract(left, right); break;
+            case PYX_IR_MUL: result = PyNumber_Multiply(left, right); break;
+            case PYX_IR_MATMUL: result = PyNumber_MatrixMultiply(left, right); break;
+            case PYX_IR_DIV: result = PyNumber_TrueDivide(left, right); break;
+            case PYX_IR_FLOORDIV: result = PyNumber_FloorDivide(left, right); break;
+            case PYX_IR_MOD: result = PyNumber_Remainder(left, right); break;
+            case PYX_IR_POW: result = PyNumber_Power(left, right, Py_None); break;
+            case PYX_IR_LSHIFT: result = PyNumber_Lshift(left, right); break;
+            case PYX_IR_RSHIFT: result = PyNumber_Rshift(left, right); break;
+            case PYX_IR_BITOR: result = PyNumber_Or(left, right); break;
+            case PYX_IR_BITXOR: result = PyNumber_Xor(left, right); break;
+            case PYX_IR_BITAND: result = PyNumber_And(left, right); break;
+            case PYX_IR_LT: result = PyObject_RichCompare(left, right, Py_LT); break;
+            case PYX_IR_LE: result = PyObject_RichCompare(left, right, Py_LE); break;
+            case PYX_IR_EQ: result = PyObject_RichCompare(left, right, Py_EQ); break;
+            case PYX_IR_NE: result = PyObject_RichCompare(left, right, Py_NE); break;
+            case PYX_IR_GT: result = PyObject_RichCompare(left, right, Py_GT); break;
+            case PYX_IR_GE: result = PyObject_RichCompare(left, right, Py_GE); break;
+            case PYX_IR_IS: result = PyBool_FromLong(left == right); break;
+            case PYX_IR_IS_NOT: result = PyBool_FromLong(left != right); break;
+            case PYX_IR_IN: { int rc = PySequence_Contains(right, left); result = rc < 0 ? NULL : PyBool_FromLong(rc); break; }
+            case PYX_IR_NOT_IN: { int rc = PySequence_Contains(right, left); result = rc < 0 ? NULL : PyBool_FromLong(!rc); break; }
+            case PYX_IR_AND: result = right; Py_INCREF(result); break;
+            case PYX_IR_OR: result = right; Py_INCREF(result); break;
+            default: PyErr_SetString(PyExc_SystemError, "unsupported PythonX binary operation"); break;
+        }
+        Py_DECREF(left); Py_DECREF(right);
+        return result;
     }
-    Py_DECREF(a); Py_XDECREF(b);
-    return r;
+
+    PyErr_Format(PyExc_NotImplementedError, "PythonX IR evaluator: unsupported operation %d", (int)node->op);
+    return NULL;
 }
 
 PyObject *_PyX_IR_Evaluate(const PyXIRNode *node, PyObject *globals)
 {
     if (!node || !globals || !PyDict_Check(globals)) {
-        PyErr_SetString(PyExc_TypeError, "PythonX IR evaluation requires a globals dictionary");
+        PyErr_SetString(PyExc_TypeError, "invalid PythonX IR evaluation state");
         return NULL;
     }
     return eval_node(node, globals);
