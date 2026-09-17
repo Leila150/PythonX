@@ -10,6 +10,14 @@ extern "C" {
 
 typedef enum {
     PYX_IR_CONST = 1,
+
+    /* Python container/literal types. */
+    PYX_IR_LIST,
+    PYX_IR_TUPLE,
+    PYX_IR_SET,
+    PYX_IR_DICT,
+
+    /* Operators. */
     PYX_IR_ADD, PYX_IR_SUB, PYX_IR_MUL, PYX_IR_MATMUL,
     PYX_IR_DIV, PYX_IR_FLOORDIV, PYX_IR_MOD, PYX_IR_POW,
     PYX_IR_LSHIFT, PYX_IR_RSHIFT, PYX_IR_BITOR, PYX_IR_BITXOR, PYX_IR_BITAND,
@@ -27,6 +35,10 @@ struct PyXIRNode {
     PyObject *constant;
     PyXIRNode *left;
     PyXIRNode *right;
+
+    /* Used by variable-sized literals such as list/tuple/set/dict. */
+    PyXIRNode **children;
+    Py_ssize_t child_count;
 };
 
 typedef struct {
