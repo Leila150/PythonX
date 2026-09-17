@@ -7,17 +7,14 @@ instantiate_exception(PyObject *exception)
     if (!exception) {
         return NULL;
     }
-
     if (PyExceptionInstance_Check(exception)) {
         return Py_NewRef(exception);
     }
-
     if (!PyExceptionClass_Check(exception)) {
         PyErr_SetString(PyExc_TypeError,
                         "exceptions must derive from BaseException");
         return NULL;
     }
-
     return PyObject_CallNoArgs(exception);
 }
 
@@ -42,8 +39,7 @@ _PyX_StatementRaise(PyObject *exception, PyObject *cause)
         }
 
         /* PyException_SetCause() steals its argument and marks the explicit
-           cause as suppressing implicit context.  Passing NULL represents
-           the Python spelling `raise ... from None`. */
+           cause as suppressing implicit context. NULL represents `from None`. */
         PyObject *owned_cause = cause == Py_None ? NULL : Py_NewRef(cause);
         PyException_SetCause(raised, owned_cause);
     }
@@ -108,8 +104,7 @@ _PyX_BeginExceptionHandler(PyObject *exception)
         return -1;
     }
 
-    PyObject *owned = Py_NewRef(exception);
-    PyErr_SetHandledException(owned);
+    PyErr_SetHandledException(Py_NewRef(exception));
     return 0;
 }
 
@@ -183,7 +178,10 @@ _PyX_WrapExceptionGroup(PyObject *exception)
     }
 
     PyObject *items = PyTuple_Pack(1, exception);
-    if (!items) {
+    PyObject *message = PyUnicode_FromString("");
+    if (!items || !message) {
+        Py_XDECREF(items);
+        Py_XDECREF(message);
         return NULL;
     }
 
@@ -191,13 +189,14 @@ _PyX_WrapExceptionGroup(PyObject *exception)
     if (PyExc_ExceptionGroup &&
         PyObject_IsInstance(exception, PyExc_Exception) == 1) {
         group = PyObject_CallFunctionObjArgs(
-            PyExc_ExceptionGroup, PyUnicode_FromString(""), items, NULL);
+            PyExc_ExceptionGroup, message, items, NULL);
     }
     else {
         group = PyObject_CallFunctionObjArgs(
-            PyExc_BaseExceptionGroup, PyUnicode_FromString(""), items, NULL);
+            PyExc_BaseExceptionGroup, message, items, NULL);
     }
 
+    Py_DECREF(message);
     Py_DECREF(items);
     return group;
 }
