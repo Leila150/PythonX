@@ -23,6 +23,7 @@ typedef struct {
     unsigned char *code;
     size_t size;
     PyXIRNode *root;
+    PyObject *globals;
 } XIRNativeCode;
 
 typedef PyObject *(*XIRNativeFunction)(void);
@@ -58,14 +59,18 @@ static int code_u64(XIRCode *code, uint64_t value)
     return code_bytes(code, bytes, sizeof(bytes));
 }
 
-static int emit_mov_arg_imm64(XIRCode *code, uint64_t value)
+static int emit_mov_arg_imm64(XIRCode *code, uint64_t value, int argument)
 {
 #if defined(_WIN32)
-    static const unsigned char op[] = {0x48, 0xB9}; /* mov rcx, imm64 */
+    static const unsigned char rcx[] = {0x48, 0xB9};
+    static const unsigned char rdx[] = {0x48, 0xBA};
+    const unsigned char *op = argument == 1 ? rcx : rdx;
 #else
-    static const unsigned char op[] = {0x48, 0xBF}; /* mov rdi, imm64 */
+    static const unsigned char rdi[] = {0x48, 0xBF};
+    static const unsigned char rsi[] = {0x48, 0xBE};
+    const unsigned char *op = argument == 1 ? rdi : rsi;
 #endif
-    return code_bytes(code, op, sizeof(op)) || code_u64(code, value);
+    return code_bytes(code, op, 2) || code_u64(code, value);
 }
 
 static int emit_call_imm64(XIRCode *code, uint64_t address)
@@ -106,6 +111,7 @@ static void native_ir_capsule_destructor(PyObject *capsule)
     free_executable(native->code, native->size);
     PyXIRFunction function = {native->root};
     _PyX_IR_Free(&function);
+    Py_XDECREF(native->globals);
     PyMem_RawFree(native);
 }
 
@@ -117,14 +123,20 @@ PyObject *_PyX_NativeCompileIR(const PyXIRFunction *function)
     }
 
     XIRCode code = {0};
-    if (emit_mov_arg_imm64(&code, (uint64_t)(uintptr_t)function->root) < 0 ||
+    PyObject *globals = PyDict_New();
+    if (!globals) return NULL;
+
+    if (emit_mov_arg_imm64(&code, (uint64_t)(uintptr_t)function->root, 1) < 0 ||
+        emit_mov_arg_imm64(&code, (uint64_t)(uintptr_t)globals, 2) < 0 ||
         emit_call_imm64(&code, (uint64_t)(uintptr_t)&_PyX_IR_Evaluate) < 0) {
+        Py_DECREF(globals);
         PyMem_RawFree(code.data);
         return NULL;
     }
 
     void *memory = alloc_executable(code.size);
     if (!memory) {
+        Py_DECREF(globals);
         PyMem_RawFree(code.data);
         PyErr_SetString(PyExc_MemoryError, "PythonX could not allocate executable memory");
         return NULL;
@@ -135,22 +147,23 @@ PyObject *_PyX_NativeCompileIR(const PyXIRFunction *function)
     XIRNativeCode *native = PyMem_RawMalloc(sizeof(*native));
     if (!native) {
         free_executable(memory, code.size);
+        Py_DECREF(globals);
         PyErr_NoMemory();
         return NULL;
     }
     native->code = memory;
     native->size = code.size;
     native->root = function->root;
+    native->globals = globals;
 
-    /* Ownership transfers from the caller's IR function to the native capsule. */
     ((PyXIRFunction *)function)->root = NULL;
 
-    PyObject *capsule = PyCapsule_New(native, "PythonX.native_ir_code",
-                                      native_ir_capsule_destructor);
+    PyObject *capsule = PyCapsule_New(native, "PythonX.native_ir_code", native_ir_capsule_destructor);
     if (!capsule) {
         PyXIRFunction owned = {native->root};
         _PyX_IR_Free(&owned);
         free_executable(memory, code.size);
+        Py_DECREF(globals);
         PyMem_RawFree(native);
         return NULL;
     }
@@ -164,7 +177,7 @@ PyObject *_PyX_NativeExecuteIR(PyObject *native_code)
         return NULL;
     }
     XIRNativeCode *native = PyCapsule_GetPointer(native_code, "PythonX.native_ir_code");
-    if (!native || !native->code || !native->size) {
+    if (!native || !native->code || !native->size || !native->globals) {
         PyErr_SetString(PyExc_RuntimeError, "PythonX native IR code is empty");
         return NULL;
     }
@@ -176,16 +189,14 @@ PyObject *_PyX_NativeExecuteIR(PyObject *native_code)
 PyObject *_PyX_NativeCompileIR(const PyXIRFunction *function)
 {
     (void)function;
-    PyErr_SetString(PyExc_NotImplementedError,
-                    "PythonX native backend currently targets x86-64");
+    PyErr_SetString(PyExc_NotImplementedError, "PythonX native backend currently targets x86-64");
     return NULL;
 }
 
 PyObject *_PyX_NativeExecuteIR(PyObject *native_code)
 {
     (void)native_code;
-    PyErr_SetString(PyExc_NotImplementedError,
-                    "PythonX native backend currently targets x86-64");
+    PyErr_SetString(PyExc_NotImplementedError, "PythonX native backend currently targets x86-64");
     return NULL;
 }
 
