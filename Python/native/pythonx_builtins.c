@@ -139,11 +139,11 @@ PyXNative_Input(PyObject *prompt)
     if (PyUnicode_Check(result)) {
         Py_ssize_t size = PyUnicode_GET_LENGTH(result);
         if (size > 0 && PyUnicode_READ_CHAR(result, size - 1) == '\n') {
-            PyUnicodeWriter *writer = PyUnicodeWriter_Create(size - 1);
-            if (writer != NULL) {
-                PyUnicodeWriter_WriteSubstring(writer, result, 0, size - 1);
-                Py_SETREF(result, PyUnicodeWriter_Finish(writer));
+            PyObject *trimmed = PyUnicode_Substring(result, 0, size - 1);
+            if (trimmed == NULL) {
+                goto error;
             }
+            Py_SETREF(result, trimmed);
         }
     }
 
