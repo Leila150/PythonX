@@ -30,7 +30,21 @@ typedef enum {
     PYX_IR_NOT,
     PYX_IR_LT, PYX_IR_LE, PYX_IR_EQ, PYX_IR_NE, PYX_IR_GT, PYX_IR_GE,
     PYX_IR_IS, PYX_IR_IS_NOT, PYX_IR_IN, PYX_IR_NOT_IN,
-    PYX_IR_AND, PYX_IR_OR
+    PYX_IR_AND, PYX_IR_OR,
+
+    /* Python exception/error control. These represent Python semantics; they
+       are not PythonX-specific exception types. */
+    PYX_IR_RAISE,
+    PYX_IR_RERAISE,
+    PYX_IR_ASSERT,
+    PYX_IR_TRY,
+    PYX_IR_EXCEPT,
+    PYX_IR_FINALLY,
+    PYX_IR_EXCEPTION_MATCH,
+    PYX_IR_EXCEPTION_BIND,
+    PYX_IR_EXCEPTION_CLEAR,
+    PYX_IR_EXCEPTION_GROUP,
+    PYX_IR_EXCEPT_STAR
 } PyXIROp;
 
 typedef struct PyXIRNode PyXIRNode;
