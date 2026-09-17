@@ -46,6 +46,7 @@ struct PyXIRNode {
 
 typedef struct {
     PyXIRNode *root;
+    PyObject *globals;
 } PyXIRFunction;
 
 PyAPI_FUNC(void) _PyX_IR_Free(PyXIRFunction *function);
