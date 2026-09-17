@@ -17,6 +17,11 @@ typedef enum {
     PYX_IR_SET,
     PYX_IR_DICT,
 
+    /* Variables and statement sequencing. */
+    PYX_IR_NAME_LOAD,
+    PYX_IR_NAME_STORE,
+    PYX_IR_SEQUENCE,
+
     /* Operators. */
     PYX_IR_ADD, PYX_IR_SUB, PYX_IR_MUL, PYX_IR_MATMUL,
     PYX_IR_DIV, PYX_IR_FLOORDIV, PYX_IR_MOD, PYX_IR_POW,
@@ -35,8 +40,6 @@ struct PyXIRNode {
     PyObject *constant;
     PyXIRNode *left;
     PyXIRNode *right;
-
-    /* Used by variable-sized literals such as list/tuple/set/dict. */
     PyXIRNode **children;
     Py_ssize_t child_count;
 };
@@ -48,7 +51,7 @@ typedef struct {
 PyAPI_FUNC(void) _PyX_IR_Free(PyXIRFunction *function);
 PyAPI_FUNC(int) _PyX_IR_FromAST(mod_ty module, PyXIRFunction *function);
 PyAPI_FUNC(const char *) _PyX_IR_OpName(PyXIROp op);
-PyAPI_FUNC(PyObject *) _PyX_IR_Evaluate(const PyXIRNode *node);
+PyAPI_FUNC(PyObject *) _PyX_IR_Evaluate(const PyXIRNode *node, PyObject *globals);
 
 #ifdef __cplusplus
 }
