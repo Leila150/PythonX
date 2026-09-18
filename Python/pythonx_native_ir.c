@@ -270,6 +270,13 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
             Py_DECREF(object); Py_DECREF(key);
             return rc < 0 ? NULL : Py_NewRef(Py_None);
         }
+    case PYX_IR_DELATTR: {
+        PyObject *object = px_eval(n->left, g, s);
+        if (!object) return NULL;
+        int rc = PyObject_DelAttr(object, n->constant);
+        Py_DECREF(object);
+        return rc < 0 ? NULL : Py_NewRef(Py_None);
+    }
     case PYX_IR_GETATTR: {
         PyObject *object = px_eval(n->left, g, s); if (!object) return NULL;
         PyObject *result = PyObject_GetAttr(object, n->constant); Py_DECREF(object); return result;
