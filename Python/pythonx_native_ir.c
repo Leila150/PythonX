@@ -11,7 +11,7 @@
 #endif
 
 typedef enum { PX_NORMAL=0, PX_BREAK, PX_CONTINUE, PX_RETURN } PXFlow;
-typedef struct { PXFlow flow; } PXState;
+typedef struct { PXFlow flow; int loop_depth; } PXState;
 
 static PyObject *px_eval(const PyXIRNode *, PyObject *, PXState *);
 
@@ -128,11 +128,12 @@ static int px_assign_target(const PyXIRNode *target, PyObject *g, PyObject *valu
 
 static PyObject *px_for(const PyXIRNode *n, PyObject *g, PXState *s, int async_for)
 {
+    s->loop_depth++;
     PyObject *source = px_eval(n->children[0], g, s);
-    if (!source) return NULL;
+    if (!source) { s->loop_depth--; return NULL; }
     PyObject *iterator = async_for ? PyObject_CallMethod(source, "__aiter__", NULL) : PyObject_GetIter(source);
     Py_DECREF(source);
-    if (!iterator) return NULL;
+    if (!iterator) { s->loop_depth--; return NULL; }
 
     PyObject *result = Py_NewRef(Py_None);
     int broke = 0;
@@ -142,32 +143,33 @@ static PyObject *px_for(const PyXIRNode *n, PyObject *g, PXState *s, int async_f
             PyObject *awaitable = PyObject_CallMethod(iterator, "__anext__", NULL);
             if (!awaitable) {
                 if (PyErr_ExceptionMatches(PyExc_StopAsyncIteration)) { PyErr_Clear(); break; }
-                Py_DECREF(iterator); Py_DECREF(result); return NULL;
+                Py_DECREF(iterator); Py_DECREF(result); s->loop_depth--; return NULL;
             }
             item = px_await(awaitable);
             Py_DECREF(awaitable);
-            if (!item) { Py_DECREF(iterator); Py_DECREF(result); return NULL; }
+            if (!item) { Py_DECREF(iterator); Py_DECREF(result); s->loop_depth--; return NULL; }
         } else {
             item = PyIter_Next(iterator);
             if (!item) {
-                if (PyErr_Occurred()) { Py_DECREF(iterator); Py_DECREF(result); return NULL; }
+                if (PyErr_Occurred()) { Py_DECREF(iterator); Py_DECREF(result); s->loop_depth--; return NULL; }
                 break;
             }
         }
 
         if (px_assign_target(n->children[1], g, item, s) < 0) {
-            Py_DECREF(item); Py_DECREF(iterator); Py_DECREF(result); return NULL;
+            Py_DECREF(item); Py_DECREF(iterator); Py_DECREF(result); s->loop_depth--; return NULL;
         }
         Py_DECREF(item);
 
         PyObject *body = px_eval(n->children[2], g, s);
-        if (!body) { Py_DECREF(iterator); Py_DECREF(result); return NULL; }
+        if (!body) { Py_DECREF(iterator); Py_DECREF(result); s->loop_depth--; return NULL; }
         Py_DECREF(body);
         if (s->flow == PX_BREAK) { s->flow = PX_NORMAL; broke = 1; break; }
         if (s->flow == PX_CONTINUE) { s->flow = PX_NORMAL; continue; }
-        if (s->flow != PX_NORMAL) { Py_DECREF(iterator); Py_DECREF(result); return NULL; }
+        if (s->flow != PX_NORMAL) { Py_DECREF(iterator); Py_DECREF(result); s->loop_depth--; return NULL; }
     }
     Py_DECREF(iterator);
+    s->loop_depth--;
 
     if (!broke) {
         PyObject *else_result = px_eval(n->children[3], g, s);
@@ -304,14 +306,19 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         PyObject*t=px_eval(n->children[0],g,s);if(!t)return NULL;int truth=PyObject_IsTrue(t);Py_DECREF(t);if(truth<0)return NULL;return px_eval(n->children[truth?1:2],g,s);
     }
     case PYX_IR_WHILE: {
+        s->loop_depth++;
         PyObject*result=Py_NewRef(Py_None);int broke=0;
-        for(;;){PyObject*t=px_eval(n->children[0],g,s);if(!t){Py_DECREF(result);return NULL;}int truth=PyObject_IsTrue(t);Py_DECREF(t);if(truth<0){Py_DECREF(result);return NULL;}if(!truth)break;PyObject*x=px_eval(n->children[1],g,s);if(!x){Py_DECREF(result);return NULL;}Py_DECREF(x);if(s->flow==PX_BREAK){s->flow=PX_NORMAL;broke=1;break;}if(s->flow==PX_CONTINUE){s->flow=PX_NORMAL;continue;}if(s->flow!=PX_NORMAL){Py_DECREF(result);return NULL;}}
+        for(;;){PyObject*t=px_eval(n->children[0],g,s);if(!t){Py_DECREF(result);s->loop_depth--;return NULL;}int truth=PyObject_IsTrue(t);Py_DECREF(t);if(truth<0){Py_DECREF(result);s->loop_depth--;return NULL;}if(!truth)break;PyObject*x=px_eval(n->children[1],g,s);if(!x){Py_DECREF(result);s->loop_depth--;return NULL;}Py_DECREF(x);if(s->flow==PX_BREAK){s->flow=PX_NORMAL;broke=1;break;}if(s->flow==PX_CONTINUE){s->flow=PX_NORMAL;continue;}if(s->flow!=PX_NORMAL){Py_DECREF(result);s->loop_depth--;return NULL;}}
         if(!broke){PyObject*x=px_eval(n->children[2],g,s);if(!x){Py_DECREF(result);return NULL;}Py_SETREF(result,x);}return result;
     }
     case PYX_IR_FOR:return px_for(n,g,s,0);
     case PYX_IR_ASYNC_FOR:return px_for(n,g,s,1);
-    case PYX_IR_BREAK:s->flow=PX_BREAK;return Py_NewRef(Py_None);
-    case PYX_IR_CONTINUE:s->flow=PX_CONTINUE;return Py_NewRef(Py_None);
+    case PYX_IR_BREAK:
+        if (s->loop_depth <= 0) { PyErr_SetString(PyExc_SyntaxError, "'break' outside loop"); return NULL; }
+        s->flow=PX_BREAK; return Py_NewRef(Py_None);
+    case PYX_IR_CONTINUE:
+        if (s->loop_depth <= 0) { PyErr_SetString(PyExc_SyntaxError, "'continue' not properly in loop"); return NULL; }
+        s->flow=PX_CONTINUE; return Py_NewRef(Py_None);
     case PYX_IR_RETURN:s->flow=PX_RETURN;return n->left?px_eval(n->left,g,s):Py_NewRef(Py_None);
     case PYX_IR_AWAIT:{PyObject*a=px_eval(n->left,g,s);if(!a)return NULL;PyObject*r=px_await(a);Py_DECREF(a);return r;}
     case PYX_IR_WITH:return px_with(n,g,s,0);
