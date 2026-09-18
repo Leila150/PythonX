@@ -14,6 +14,162 @@ typedef enum { PX_NORMAL=0, PX_BREAK, PX_CONTINUE, PX_RETURN } PXFlow;
 typedef struct { PXFlow flow; int loop_depth; } PXState;
 
 static PyObject *px_eval(const PyXIRNode *, PyObject *, PXState *);
+typedef struct {
+    const PyXIRNode *node;
+    PyObject *globals;
+    PyObject *defaults;
+    PyObject *kwdefaults;
+} PXLambdaClosure;
+
+static void px_lambda_free(PyObject *capsule)
+{
+    PXLambdaClosure *c = PyCapsule_GetPointer(capsule, "PythonX.lambda");
+    if (!c) { PyErr_Clear(); return; }
+    Py_XDECREF(c->globals);
+    Py_XDECREF(c->defaults);
+    Py_XDECREF(c->kwdefaults);
+    PyMem_Free(c);
+}
+
+static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    PyObject *capsule = PyCFunction_GET_SELF(self);
+    PXLambdaClosure *c = PyCapsule_GetPointer(capsule, "PythonX.lambda");
+    if (!c) return NULL;
+    const PyXIRNode *n = c->node;
+    PyObject *meta = n->constant;
+    Py_ssize_t posonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 0));
+    Py_ssize_t positional = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 1));
+    Py_ssize_t kwonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 2));
+    PyObject *vararg_name = PyTuple_GET_ITEM(meta, 3);
+    PyObject *kwarg_name = PyTuple_GET_ITEM(meta, 4);
+    PyObject *names = PyTuple_GET_ITEM(meta, 5);
+    Py_ssize_t total_pos = posonly + positional;
+
+    if (posonly < 0 || positional < 0 || kwonly < 0) return NULL;
+    if (PyTuple_GET_SIZE(args) > total_pos && vararg_name == Py_None) {
+        PyErr_Format(PyExc_TypeError, "<lambda>() takes %zd positional arguments but %zd were given",
+                     total_pos, PyTuple_GET_SIZE(args));
+        return NULL;
+    }
+
+    PyObject *locals = PyDict_New();
+    if (!locals) return NULL;
+
+    for (Py_ssize_t i = 0; i < total_pos; ++i) {
+        PyObject *name = PyTuple_GET_ITEM(names, i);
+        PyObject *value = NULL;
+        if (i < PyTuple_GET_SIZE(args)) value = PyTuple_GET_ITEM(args, i);
+        else if (kwargs) value = PyDict_GetItemWithError(kwargs, name);
+        if (!value && PyErr_Occurred()) goto error;
+        if (!value) {
+            Py_ssize_t default_index = i - (total_pos - PyTuple_GET_SIZE(c->defaults));
+            if (default_index >= 0) value = PyTuple_GET_ITEM(c->defaults, default_index);
+        }
+        if (!value) {
+            PyErr_Format(PyExc_TypeError, "<lambda>() missing required argument: '%U'", name);
+            goto error;
+        }
+        if (i < posonly && kwargs && PyDict_GetItemWithError(kwargs, name)) {
+            PyErr_Format(PyExc_TypeError, "<lambda>() got some positional-only arguments passed as keyword arguments: '%U'", name);
+            goto error;
+        }
+        if (PyDict_SetItem(locals, name, value) < 0) goto error;
+    }
+
+    if (vararg_name != Py_None) {
+        PyObject *extra = PyTuple_GetSlice(args, total_pos, PyTuple_GET_SIZE(args));
+        if (!extra) goto error;
+        if (PyDict_SetItem(locals, vararg_name, extra) < 0) { Py_DECREF(extra); goto error; }
+        Py_DECREF(extra);
+    }
+
+    for (Py_ssize_t i = total_pos; i < total_pos + kwonly; ++i) {
+        PyObject *name = PyTuple_GET_ITEM(names, i);
+        PyObject *value = kwargs ? PyDict_GetItemWithError(kwargs, name) : NULL;
+        if (!value && PyErr_Occurred()) goto error;
+        if (!value && c->kwdefaults) value = PyDict_GetItemWithError(c->kwdefaults, name);
+        if (!value) {
+            PyErr_Format(PyExc_TypeError, "<lambda>() missing required keyword-only argument: '%U'", name);
+            goto error;
+        }
+        if (PyDict_SetItem(locals, name, value) < 0) goto error;
+    }
+
+    if (kwarg_name != Py_None) {
+        PyObject *extra = PyDict_New();
+        if (!extra) goto error;
+        if (kwargs) {
+            PyObject *key, *value;
+            Py_ssize_t p = 0;
+            while (PyDict_Next(kwargs, &p, &key, &value)) {
+                if (!PyTuple_GET_SIZE(names) || !PyDict_Contains(locals, key)) {
+                    if (PyDict_SetItem(extra, key, value) < 0) { Py_DECREF(extra); goto error; }
+                }
+            }
+        }
+        if (PyDict_SetItem(locals, kwarg_name, extra) < 0) { Py_DECREF(extra); goto error; }
+        Py_DECREF(extra);
+    }
+
+    PXState state = {PX_NORMAL, 0};
+    PyObject *result = px_eval(n->left, locals, &state);
+    Py_DECREF(locals);
+    return result;
+error:
+    Py_DECREF(locals);
+    return NULL;
+}
+
+static PyMethodDef px_lambda_method = {
+    "lambda", (PyCFunction)(void(*)(void))px_lambda_call, METH_VARARGS | METH_KEYWORDS, NULL
+};
+
+static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
+{
+    PyObject *defaults = PyTuple_New(0);
+    PyObject *kwdefaults = PyDict_New();
+    if (!defaults || !kwdefaults) { Py_XDECREF(defaults); Py_XDECREF(kwdefaults); return NULL; }
+
+    Py_ssize_t nd = PyTuple_GET_SIZE(n->constant) >= 0 ? n->child_count : 0;
+    Py_ssize_t positional = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 1));
+    Py_ssize_t total_pos = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 0)) + positional;
+    Py_ssize_t pos_defaults = n->child_count;
+    Py_ssize_t kwonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 2));
+    if (pos_defaults > total_pos) pos_defaults = total_pos - kwonly;
+    PyObject *pos = PyTuple_New(pos_defaults);
+    if (!pos) { Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
+
+    Py_ssize_t nd_total = n->child_count;
+    Py_ssize_t nd_pos = nd_total - kwonly;
+    if (nd_pos < 0) nd_pos = 0;
+    for (Py_ssize_t i = 0; i < nd_pos; ++i) {
+        PyObject *v = px_eval(n->children[i], g, s);
+        if (!v) { Py_DECREF(pos); Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
+        PyTuple_SET_ITEM(pos, i, v);
+    }
+    for (Py_ssize_t i = 0; i < kwonly; ++i) {
+        PyXIRNode *d = n->children[nd_pos + i];
+        if (!d) continue;
+        PyObject *v = px_eval(d, g, s);
+        if (!v) { Py_DECREF(pos); Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
+        PyObject *name = PyTuple_GET_ITEM(PyTuple_GET_ITEM(n->constant, 5), total_pos + i);
+        if (PyDict_SetItem(kwdefaults, name, v) < 0) { Py_DECREF(v); Py_DECREF(pos); Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
+        Py_DECREF(v);
+    }
+    Py_DECREF(defaults);
+    defaults = pos;
+
+    PXLambdaClosure *closure = PyMem_Calloc(1, sizeof(*closure));
+    if (!closure) { Py_DECREF(defaults); Py_DECREF(kwdefaults); PyErr_NoMemory(); return NULL; }
+    closure->node = n; closure->globals = Py_NewRef(g); closure->defaults = defaults; closure->kwdefaults = kwdefaults;
+    PyObject *capsule = PyCapsule_New(closure, "PythonX.lambda", px_lambda_free);
+    if (!capsule) { px_lambda_free(PyCapsule_New(closure, "PythonX.lambda", NULL)); return NULL; }
+    PyObject *fn = PyCFunction_NewEx(&px_lambda_method, capsule, NULL);
+    Py_DECREF(capsule);
+    return fn;
+}
+
 
 static PyObject *px_suite(const PyXIRNode *n, PyObject *g, PXState *s)
 {
@@ -309,6 +465,8 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         return result;
     }
     case PYX_IR_CALL:return px_call(n,g,s);
+    case PYX_IR_LAMBDA:return px_lambda(n,g,s);
+
     case PYX_IR_IF: {
         PyObject*t=px_eval(n->children[0],g,s);if(!t)return NULL;int truth=PyObject_IsTrue(t);Py_DECREF(t);if(truth<0)return NULL;return px_eval(n->children[truth?1:2],g,s);
     }
