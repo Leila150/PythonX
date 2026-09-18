@@ -53,14 +53,19 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         return NULL;
     }
 
-    PyObject *locals = PyDict_New();
+    PyObject *locals = PyDict_Copy(c->globals);
     if (!locals) return NULL;
 
     for (Py_ssize_t i = 0; i < total_pos; ++i) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
         PyObject *value = NULL;
-        if (i < PyTuple_GET_SIZE(args)) value = PyTuple_GET_ITEM(args, i);
-        else if (kwargs) value = PyDict_GetItemWithError(kwargs, name);
+        if (i < PyTuple_GET_SIZE(args)) {
+            value = PyTuple_GET_ITEM(args, i);
+            if (kwargs && PyDict_GetItemWithError(kwargs, name)) {
+                PyErr_Format(PyExc_TypeError, "<lambda>() got multiple values for argument '%U'", name);
+                goto error;
+            }
+        } else if (kwargs) value = PyDict_GetItemWithError(kwargs, name);
         if (!value && PyErr_Occurred()) goto error;
         if (!value) {
             Py_ssize_t default_index = i - (total_pos - PyTuple_GET_SIZE(c->defaults));
@@ -103,7 +108,9 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
             PyObject *key, *value;
             Py_ssize_t p = 0;
             while (PyDict_Next(kwargs, &p, &key, &value)) {
-                if (!PyTuple_GET_SIZE(names) || !PyDict_Contains(locals, key)) {
+                int formal = PySequence_Contains(names, key);
+                if (formal < 0) { Py_DECREF(extra); goto error; }
+                if (!formal) {
                     if (PyDict_SetItem(extra, key, value) < 0) { Py_DECREF(extra); goto error; }
                 }
             }
