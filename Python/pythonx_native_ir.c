@@ -226,25 +226,64 @@ error:
 
 static PyObject *px_await(PyObject *awaitable)
 {
-    PyObject *iterator = PyObject_CallMethod(awaitable, "__await__", NULL);
+    PyObject *iterator = PyObject_GetIter(awaitable);
+    if (!iterator) {
+        PyErr_Clear();
+        iterator = PyObject_CallMethod(awaitable, "__await__", NULL);
+    }
     if (!iterator) return NULL;
+
+    PyObject *send_value = Py_NewRef(Py_None);
     for (;;) {
-        PyObject *value = PyIter_Next(iterator);
+        PyObject *value = PyObject_CallMethod(iterator, "send", "O", send_value);
+        Py_DECREF(send_value);
+        send_value = NULL;
+
         if (!value) {
-            if (PyErr_Occurred() && !PyErr_ExceptionMatches(PyExc_StopIteration)) {
-                Py_DECREF(iterator); return NULL;
+            if (!PyErr_ExceptionMatches(PyExc_StopIteration)) {
+                Py_DECREF(iterator);
+                return NULL;
             }
-            PyObject *type = NULL, *result = NULL, *tb = NULL;
-            PyErr_Fetch(&type, &result, &tb);
-            Py_XDECREF(type); Py_XDECREF(tb);
+            PyObject *stop = NULL, *result = NULL, *tb = NULL;
+            PyErr_Fetch(&stop, &result, &tb);
+            Py_XDECREF(tb);
+            PyErr_NormalizeException(&stop, &result, NULL);
+            Py_XDECREF(stop);
+            if (result) {
+                PyObject *resolved = PyObject_GetAttrString(result, "value");
+                Py_DECREF(result);
+                if (resolved) result = resolved;
+                else { PyErr_Clear(); result = Py_NewRef(Py_None); }
+            } else {
+                result = Py_NewRef(Py_None);
+            }
             Py_DECREF(iterator);
-            return result ? result : Py_NewRef(Py_None);
+            return result;
         }
+
+        if (value == Py_None) {
+            send_value = Py_NewRef(Py_None);
+            Py_DECREF(value);
+            continue;
+        }
+
+        PyObject *nested = PyObject_CallMethod(value, "__await__", NULL);
+        if (!nested) {
+            PyErr_SetString(PyExc_RuntimeError,
+                            "PythonX: native await received a non-awaitable suspension value");
+            Py_DECREF(value);
+            Py_DECREF(iterator);
+            return NULL;
+        }
+        Py_DECREF(nested);
+
+        PyObject *resolved = px_await(value);
         Py_DECREF(value);
-        Py_DECREF(iterator);
-        PyErr_SetString(PyExc_RuntimeError,
-                        "PythonX: await suspended; native async frame support is required to resume it");
-        return NULL;
+        if (!resolved) {
+            Py_DECREF(iterator);
+            return NULL;
+        }
+        send_value = resolved;
     }
 }
 
