@@ -353,11 +353,13 @@ static PyObject *px_with(const PyXIRNode *n, PyObject *g, PXState *s, int async_
         if (!value) { Py_DECREF(manager); goto fail; }
         if (async_with) {
             PyObject *resolved = px_await(value);
-            Py_DECREF(value); value = resolved;
+            Py_DECREF(value);
+            value = resolved;
             if (!value) { Py_DECREF(manager); goto fail; }
         }
         managers[entered++] = manager;
-        if (item->children[1]->op != PYX_IR_CONST || item->children[1]->constant != Py_None) {
+        if (item->children[1]->op != PYX_IR_CONST ||
+            item->children[1]->constant != Py_None) {
             if (px_assign_target(item->children[1], g, value, s) < 0) {
                 Py_DECREF(value); goto fail;
             }
@@ -366,6 +368,88 @@ static PyObject *px_with(const PyXIRNode *n, PyObject *g, PXState *s, int async_
     }
 
     result = px_eval(n->children[count], g, s);
+
+    if (result) {
+        for (Py_ssize_t i = entered; i > 0; --i) {
+            PyObject *exit_result = async_with
+                ? PyObject_CallMethod(managers[i - 1], "__aexit__", Py_None, Py_None, Py_None)
+                : PyObject_CallMethod(managers[i - 1], "__exit__", Py_None, Py_None, Py_None);
+            if (async_with && exit_result) {
+                PyObject *resolved = px_await(exit_result);
+                Py_DECREF(exit_result); exit_result = resolved;
+            }
+            if (!exit_result) {
+                Py_DECREF(result); result = NULL;
+                for (Py_ssize_t j = i - 1; j > 0; --j) {
+                    PyObject *r = async_with
+                        ? PyObject_CallMethod(managers[j - 1], "__aexit__", Py_None, Py_None, Py_None)
+                        : PyObject_CallMethod(managers[j - 1], "__exit__", Py_None, Py_None, Py_None);
+                    Py_XDECREF(r);
+                }
+                break;
+            }
+            Py_DECREF(exit_result);
+            Py_DECREF(managers[i - 1]);
+        }
+    } else {
+        PyObject *exc_type = NULL, *exc_value = NULL, *exc_tb = NULL;
+        PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+        PyErr_NormalizeException(&exc_type, &exc_value, &exc_tb);
+
+        int suppressed = 0;
+        for (Py_ssize_t i = entered; i > 0; --i) {
+            PyObject *exit_result = async_with
+                ? PyObject_CallMethod(managers[i - 1], "__aexit__", "OOO",
+                                      exc_type ? exc_type : Py_None,
+                                      exc_value ? exc_value : Py_None,
+                                      exc_tb ? exc_tb : Py_None)
+                : PyObject_CallMethod(managers[i - 1], "__exit__", "OOO",
+                                      exc_type ? exc_type : Py_None,
+                                      exc_value ? exc_value : Py_None,
+                                      exc_tb ? exc_tb : Py_None);
+            if (async_with && exit_result) {
+                PyObject *resolved = px_await(exit_result);
+                Py_DECREF(exit_result); exit_result = resolved;
+            }
+            if (!exit_result) {
+                Py_XDECREF(exc_type); Py_XDECREF(exc_value); Py_XDECREF(exc_tb);
+                for (Py_ssize_t j = i - 1; j > 0; --j) {
+                    PyObject *r = async_with
+                        ? PyObject_CallMethod(managers[j - 1], "__aexit__", Py_None, Py_None, Py_None)
+                        : PyObject_CallMethod(managers[j - 1], "__exit__", Py_None, Py_None, Py_None);
+                    Py_XDECREF(r);
+                }
+                for (Py_ssize_t j = entered; j > 0; --j) Py_DECREF(managers[j - 1]);
+                PyMem_Free(managers);
+                return NULL;
+            }
+            int truth = PyObject_IsTrue(exit_result);
+            Py_DECREF(exit_result);
+            if (truth < 0) {
+                Py_XDECREF(exc_type); Py_XDECREF(exc_value); Py_XDECREF(exc_tb);
+                for (Py_ssize_t j = entered; j > 0; --j) Py_DECREF(managers[j - 1]);
+                PyMem_Free(managers);
+                return NULL;
+            }
+            if (truth) {
+                suppressed = 1;
+                Py_XDECREF(exc_type); Py_XDECREF(exc_value); Py_XDECREF(exc_tb);
+                exc_type = exc_value = exc_tb = NULL;
+                PyErr_Clear();
+                break;
+            }
+        }
+
+        for (Py_ssize_t i = entered; i > 0; --i) Py_DECREF(managers[i - 1]);
+        if (!suppressed) PyErr_Restore(exc_type, exc_value, exc_tb);
+        else { Py_XDECREF(exc_type); Py_XDECREF(exc_value); Py_XDECREF(exc_tb); result = Py_NewRef(Py_None); }
+    }
+
+    PyMem_Free(managers);
+    return result;
+
+fail:
+    Py_XDECREF(result);
     for (Py_ssize_t i = entered; i > 0; --i) {
         PyObject *exit_result = async_with
             ? PyObject_CallMethod(managers[i - 1], "__aexit__", Py_None, Py_None, Py_None)
@@ -374,17 +458,6 @@ static PyObject *px_with(const PyXIRNode *n, PyObject *g, PXState *s, int async_
             PyObject *resolved = px_await(exit_result);
             Py_DECREF(exit_result); exit_result = resolved;
         }
-        Py_XDECREF(exit_result);
-        Py_DECREF(managers[i - 1]);
-    }
-    PyMem_Free(managers);
-    return result;
-
-fail:
-    for (Py_ssize_t i = entered; i > 0; --i) {
-        PyObject *exit_result = async_with
-            ? PyObject_CallMethod(managers[i - 1], "__aexit__", Py_None, Py_None, Py_None)
-            : PyObject_CallMethod(managers[i - 1], "__exit__", Py_None, Py_None, Py_None);
         Py_XDECREF(exit_result);
         Py_DECREF(managers[i - 1]);
     }
