@@ -132,6 +132,37 @@ static PyXIRNode *lower_store(expr_ty target, PyXIRNode *value)
         if (!n->constant || !n->left) { ir_free_node(n); return NULL; }
         return n;
     }
+    if (target->kind == Tuple_kind || target->kind == List_kind) {
+        Py_ssize_t count = target->kind == Tuple_kind
+            ? asdl_seq_LEN(target->v.Tuple.elts)
+            : asdl_seq_LEN(target->v.List.elts);
+        n = ir_new(PYX_IR_UNPACK);
+        if (!n || set_children(n, count) < 0) { ir_free_node(n); ir_free_node(value); return NULL; }
+        n->left = value;
+        for (Py_ssize_t i = 0; i < count; ++i) {
+            expr_ty item = target->kind == Tuple_kind
+                ? (expr_ty)asdl_seq_GET(target->v.Tuple.elts, i)
+                : (expr_ty)asdl_seq_GET(target->v.List.elts, i);
+            if (item->kind == Starred_kind) {
+                PyXIRNode *star = ir_new(PYX_IR_STAR_UNPACK);
+                if (!star) { ir_free_node(n); return NULL; }
+                star->left = lower_store(item->v.Starred.value, none_node());
+                if (!star->left) { ir_free_node(star); ir_free_node(n); return NULL; }
+                n->children[i] = star;
+            } else {
+                n->children[i] = lower_store(item, none_node());
+            }
+            if (!n->children[i]) { ir_free_node(n); return NULL; }
+        }
+        return n;
+    }
+    if (target->kind == Starred_kind) {
+        n = ir_new(PYX_IR_STAR_UNPACK);
+        if (!n) { ir_free_node(value); return NULL; }
+        n->left = lower_store(target->v.Starred.value, value);
+        if (!n->left) { ir_free_node(n); return NULL; }
+        return n;
+    }
     if (target->kind == Subscript_kind) {
         n = ir_new(PYX_IR_SUBSCRIPT_STORE);
         if (!n || set_children(n, 3) < 0) { ir_free_node(n); ir_free_node(value); return NULL; }
@@ -179,6 +210,21 @@ static PyXIRNode *lower_delete(expr_ty target)
         n->children[1] = target->v.Subscript.slice->kind == Slice_kind
             ? lower_slice(target->v.Subscript.slice) : lower_expr(target->v.Subscript.slice);
         if (!n->children[0] || !n->children[1]) { ir_free_node(n); return NULL; }
+        return n;
+    }
+    if (target->kind == Tuple_kind || target->kind == List_kind) {
+        Py_ssize_t count = target->kind == Tuple_kind
+            ? asdl_seq_LEN(target->v.Tuple.elts)
+            : asdl_seq_LEN(target->v.List.elts);
+        n = ir_new(PYX_IR_SEQUENCE);
+        if (!n || set_children(n, count) < 0) { ir_free_node(n); return NULL; }
+        for (Py_ssize_t i = 0; i < count; ++i) {
+            expr_ty item = target->kind == Tuple_kind
+                ? (expr_ty)asdl_seq_GET(target->v.Tuple.elts, i)
+                : (expr_ty)asdl_seq_GET(target->v.List.elts, i);
+            n->children[i] = lower_delete(item);
+            if (!n->children[i]) { ir_free_node(n); return NULL; }
+        }
         return n;
     }
     PyErr_SetString(PyExc_NotImplementedError, "PythonX: unsupported delete target");
