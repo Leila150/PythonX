@@ -816,6 +816,49 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
     case PYX_IR_ASSERT:{PyObject*t=px_eval(n->children[0],g,s),*m=px_eval(n->children[1],g,s);if(!t||!m){Py_XDECREF(t);Py_XDECREF(m);return NULL;}int rc=_PyX_StatementAssert(t,m);Py_DECREF(t);Py_DECREF(m);return rc<0?NULL:Py_NewRef(Py_None);}
     case PYX_IR_NOT:case PYX_IR_INVERT:case PYX_IR_POSITIVE:case PYX_IR_NEGATIVE:{PyObject*v=px_eval(n->left,g,s);if(!v)return NULL;PyObject*r;if(n->op==PYX_IR_NOT){int t=PyObject_IsTrue(v);r=t<0?NULL:PyBool_FromLong(!t);}else if(n->op==PYX_IR_INVERT)r=PyNumber_Invert(v);else if(n->op==PYX_IR_POSITIVE)r=PyNumber_Positive(v);else r=PyNumber_Negative(v);Py_DECREF(v);return r;}
     case PYX_IR_SLICE:{PyObject*a=px_eval(n->children[0],g,s),*b=px_eval(n->children[1],g,s),*c=px_eval(n->children[2],g,s);if(!a||!b||!c){Py_XDECREF(a);Py_XDECREF(b);Py_XDECREF(c);return NULL;}PyObject*r=PySlice_New(a,b,c);Py_DECREF(a);Py_DECREF(b);Py_DECREF(c);return r;}
+    case PYX_IR_FSTRING:{
+        PyObject *result=PyUnicode_New(0,127);
+        if(!result)return NULL;
+        for(Py_ssize_t i=0;i<n->child_count;++i){
+            PyObject *part=px_eval(n->children[i],g,s);
+            if(!part){Py_DECREF(result);return NULL;}
+            if(!PyUnicode_Check(part)){
+                PyObject *text=PyObject_Str(part);
+                Py_DECREF(part);
+                part=text;
+                if(!part){Py_DECREF(result);return NULL;}
+            }
+            PyUnicode_AppendAndDel(&result,part);
+            if(!result)return NULL;
+        }
+        return result;
+    }
+    case PYX_IR_FORMAT_VALUE:{
+        PyObject *value=px_eval(n->children[0],g,s);
+        if(!value)return NULL;
+        long conversion=PyLong_AsLong(n->constant);
+        if(conversion==-1 && PyErr_Occurred()){Py_DECREF(value);return NULL;}
+        PyObject *converted=value;
+        if(conversion=='s') converted=PyObject_Str(value);
+        else if(conversion=='r') converted=PyObject_Repr(value);
+        else if(conversion=='a') converted=PyObject_ASCII(value);
+        else Py_INCREF(converted);
+        Py_DECREF(value);
+        if(!converted)return NULL;
+        PyObject *spec=px_eval(n->children[1],g,s);
+        if(!spec){Py_DECREF(converted);return NULL;}
+        if(spec==Py_None){Py_DECREF(spec);return converted;}
+        if(!PyUnicode_Check(spec)){
+            PyObject *tmp=PyObject_Str(spec);
+            Py_DECREF(spec);
+            spec=tmp;
+            if(!spec){Py_DECREF(converted);return NULL;}
+        }
+        PyObject *out=PyObject_Format(converted,spec);
+        Py_DECREF(converted);
+        Py_DECREF(spec);
+        return out;
+    }
     default:break;
     }
     if(n->op>=PYX_IR_ADD&&n->op<=PYX_IR_OR){PyObject*l=px_eval(n->left,g,s);if(!l)return NULL;if(n->op==PYX_IR_AND||n->op==PYX_IR_OR){int t=PyObject_IsTrue(l);if(t<0){Py_DECREF(l);return NULL;}if((n->op==PYX_IR_AND&&!t)||(n->op==PYX_IR_OR&&t))return l;}PyObject*r=px_eval(n->right,g,s);if(!r){Py_DECREF(l);return NULL;}PyObject*z=NULL;switch(n->op){case PYX_IR_ADD:z=PyNumber_Add(l,r);break;case PYX_IR_SUB:z=PyNumber_Subtract(l,r);break;case PYX_IR_MUL:z=PyNumber_Multiply(l,r);break;case PYX_IR_MATMUL:z=PyNumber_MatrixMultiply(l,r);break;case PYX_IR_DIV:z=PyNumber_TrueDivide(l,r);break;case PYX_IR_FLOORDIV:z=PyNumber_FloorDivide(l,r);break;case PYX_IR_MOD:z=PyNumber_Remainder(l,r);break;case PYX_IR_POW:z=PyNumber_Power(l,r,Py_None);break;case PYX_IR_LSHIFT:z=PyNumber_Lshift(l,r);break;case PYX_IR_RSHIFT:z=PyNumber_Rshift(l,r);break;case PYX_IR_BITOR:z=PyNumber_Or(l,r);break;case PYX_IR_BITXOR:z=PyNumber_Xor(l,r);break;case PYX_IR_BITAND:z=PyNumber_And(l,r);break;case PYX_IR_LT:z=PyObject_RichCompare(l,r,Py_LT);break;case PYX_IR_LE:z=PyObject_RichCompare(l,r,Py_LE);break;case PYX_IR_EQ:z=PyObject_RichCompare(l,r,Py_EQ);break;case PYX_IR_NE:z=PyObject_RichCompare(l,r,Py_NE);break;case PYX_IR_GT:z=PyObject_RichCompare(l,r,Py_GT);break;case PYX_IR_GE:z=PyObject_RichCompare(l,r,Py_GE);break;case PYX_IR_IS:z=PyBool_FromLong(l==r);break;case PYX_IR_IS_NOT:z=PyBool_FromLong(l!=r);break;case PYX_IR_IN:{int x=PySequence_Contains(r,l);z=x<0?NULL:PyBool_FromLong(x);break;}case PYX_IR_NOT_IN:{int x=PySequence_Contains(r,l);z=x<0?NULL:PyBool_FromLong(!x);break;}default:z=Py_NewRef(r);break;}Py_DECREF(l);Py_DECREF(r);return z;}
