@@ -738,9 +738,22 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         for(Py_ssize_t i=0;i<n->child_count;i++){PyObject*v=px_eval(n->children[i],g,s);if(!v){Py_DECREF(result);return NULL;}if(n->op==PYX_IR_LIST)PyList_SET_ITEM(result,i,v);else if(n->op==PYX_IR_TUPLE)PyTuple_SET_ITEM(result,i,v);else{int rc=PySet_Add(result,v);Py_DECREF(v);if(rc<0){Py_DECREF(result);return NULL;}}}
         return result;
     }
+    case PYX_IR_NAMED_EXPR: {
+        PyObject *value=px_eval(n->children[1],g,s); if(!value)return NULL;
+        if(px_assign_target(n->children[0],g,value,s)<0){Py_DECREF(value);return NULL;}
+        return value;
+    }
     case PYX_IR_DICT: {
         PyObject *result=PyDict_New();if(!result)return NULL;
-        for(Py_ssize_t i=0;i<n->child_count;i+=2){PyObject*k=px_eval(n->children[i],g,s),*v=px_eval(n->children[i+1],g,s);if(!k||!v){Py_XDECREF(k);Py_XDECREF(v);Py_DECREF(result);return NULL;}int rc=PyDict_SetItem(result,k,v);Py_DECREF(k);Py_DECREF(v);if(rc<0){Py_DECREF(result);return NULL;}}
+        for(Py_ssize_t i=0;i<n->child_count;i+=2){
+            PyObject *v=px_eval(n->children[i+1],g,s); if(!v){Py_DECREF(result);return NULL;}
+            if(n->children[i]->op==PYX_IR_CONST && n->children[i]->constant==Py_None){
+                if(PyDict_Update(result,v)<0){Py_DECREF(v);Py_DECREF(result);return NULL;}
+                Py_DECREF(v); continue;
+            }
+            PyObject*k=px_eval(n->children[i],g,s); if(!k){Py_DECREF(v);Py_DECREF(result);return NULL;}
+            int rc=PyDict_SetItem(result,k,v);Py_DECREF(k);Py_DECREF(v);if(rc<0){Py_DECREF(result);return NULL;}
+        }
         return result;
     }
     case PYX_IR_CALL:return px_call(n,g,s);
