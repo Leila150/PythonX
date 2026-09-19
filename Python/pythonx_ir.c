@@ -147,6 +147,19 @@ static PyXIRNode *lower_store(expr_ty target, PyXIRNode *value)
     return NULL;
 }
 
+static PyXIRNode *lower_aug_assign(stmt_ty s)
+{
+    PyXIRNode *n = ir_new(PYX_IR_AUG_ASSIGN);
+    if (!n || set_children(n, 3) < 0) { ir_free_node(n); return NULL; }
+    n->constant = PyLong_FromLong((long)s->v.AugAssign.op);
+    if (!n->constant) { ir_free_node(n); return NULL; }
+    n->children[0] = lower_expr(s->v.AugAssign.target);
+    n->children[1] = lower_expr(s->v.AugAssign.value);
+    n->children[2] = none_node();
+    if (!n->children[0] || !n->children[1] || !n->children[2]) { ir_free_node(n); return NULL; }
+    return n;
+}
+
 static PyXIRNode *lower_delete(expr_ty target)
 {
     PyXIRNode *n;
@@ -344,6 +357,7 @@ static PyXIRNode *lower_stmt(stmt_ty s)
     case Break_kind:return ir_new(PYX_IR_BREAK);
     case Continue_kind:return ir_new(PYX_IR_CONTINUE);
     case Delete_kind:{Py_ssize_t c=asdl_seq_LEN(s->v.Delete.targets);n=ir_new(PYX_IR_SEQUENCE);if(!n||set_children(n,c)<0){ir_free_node(n);return NULL;}for(Py_ssize_t i=0;i<c;++i){n->children[i]=lower_delete((expr_ty)asdl_seq_GET(s->v.Delete.targets,i));if(!n->children[i]){ir_free_node(n);return NULL;}}return n;}
+    case AugAssign_kind:return lower_aug_assign(s);
     case Assign_kind:{
         Py_ssize_t c=asdl_seq_LEN(s->v.Assign.targets);
         if(c==1)return lower_store((expr_ty)asdl_seq_GET(s->v.Assign.targets,0),lower_expr(s->v.Assign.value));
