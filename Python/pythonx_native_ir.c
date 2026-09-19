@@ -747,7 +747,7 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         PyObject *result=PyDict_New();if(!result)return NULL;
         for(Py_ssize_t i=0;i<n->child_count;i+=2){
             PyObject *v=px_eval(n->children[i+1],g,s); if(!v){Py_DECREF(result);return NULL;}
-            if(n->children[i]->op==PYX_IR_CONST && n->children[i]->constant==Py_None){
+            if(n->children[i]->op==PYX_IR_DICT_UNPACK){
                 if(PyDict_Update(result,v)<0){Py_DECREF(v);Py_DECREF(result);return NULL;}
                 Py_DECREF(v); continue;
             }
