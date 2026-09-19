@@ -354,7 +354,7 @@ static PyXIRNode *lower_expr(expr_ty e)
     case List_kind:return lower_sequence(PYX_IR_LIST,e->v.List.elts);
     case Tuple_kind:return lower_sequence(PYX_IR_TUPLE,e->v.Tuple.elts);
     case Set_kind:return lower_sequence(PYX_IR_SET,e->v.Set.elts);
-    case Dict_kind:{Py_ssize_t c=asdl_seq_LEN(e->v.Dict.keys);n=ir_new(PYX_IR_DICT);if(!n||set_children(n,c*2)<0){ir_free_node(n);return NULL;}for(Py_ssize_t i=0;i<c;++i){expr_ty k=(expr_ty)asdl_seq_GET(e->v.Dict.keys,i);n->children[i*2]=k?lower_expr(k):none_node();n->children[i*2+1]=lower_expr((expr_ty)asdl_seq_GET(e->v.Dict.values,i));if(!n->children[i*2]||!n->children[i*2+1]){ir_free_node(n);return NULL;}}return n;}
+    case Dict_kind:{Py_ssize_t c=asdl_seq_LEN(e->v.Dict.keys);n=ir_new(PYX_IR_DICT);if(!n||set_children(n,c*2)<0){ir_free_node(n);return NULL;}for(Py_ssize_t i=0;i<c;++i){expr_ty k=(expr_ty)asdl_seq_GET(e->v.Dict.keys,i);n->children[i*2]=k?lower_expr(k):ir_new(PYX_IR_DICT_UNPACK);n->children[i*2+1]=lower_expr((expr_ty)asdl_seq_GET(e->v.Dict.values,i));if(!n->children[i*2]||!n->children[i*2+1]){ir_free_node(n);return NULL;}}return n;}
     case Attribute_kind:n=ir_new(PYX_IR_GETATTR);if(!n)return NULL;n->constant=PyUnicode_FromString(e->v.Attribute.attr);n->left=lower_expr(e->v.Attribute.value);if(!n->constant||!n->left){ir_free_node(n);return NULL;}return n;
     case Subscript_kind:n=ir_new(PYX_IR_SUBSCRIPT);if(!n||set_children(n,2)<0){ir_free_node(n);return NULL;}n->children[0]=lower_expr(e->v.Subscript.value);n->children[1]=e->v.Subscript.slice->kind==Slice_kind?lower_slice(e->v.Subscript.slice):lower_expr(e->v.Subscript.slice);if(!n->children[0]||!n->children[1]){ir_free_node(n);return NULL;}return n;
     case Slice_kind:return lower_slice(e);
@@ -382,7 +382,7 @@ static PyXIRNode *lower_expr(expr_ty e)
         n->constant=PyTuple_New(c);
         if(!n->constant){ir_free_node(n);return NULL;}
         for(Py_ssize_t i=0;i<c;++i)PyTuple_SET_ITEM(n->constant,i,PyLong_FromLong((long)((cmpop_ty)asdl_seq_GET(e->v.Compare.ops,i))));
-        for(Py_ssize_t i=0;i<c;++i)if(!n->children[i]){ir_free_node(n);return NULL;}
+        for(Py_ssize_t i=0;i<c+1;++i)if(!n->children[i]){ir_free_node(n);return NULL;}
         return n;
     }
     default:PyErr_Format(PyExc_NotImplementedError,"PythonX IR: unsupported expression kind %d",(int)e->kind);return NULL;
