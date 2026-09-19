@@ -294,8 +294,72 @@ static PyObject *px_await(PyObject *awaitable)
     }
 }
 
+static int px_assign_unpack(const PyXIRNode *n, PyObject *g, PyObject *value, PXState *s)
+{
+    PyObject *seq = PySequence_Fast(value, "cannot unpack non-iterable object");
+    if (!seq) return -1;
+    Py_ssize_t count = n->child_count;
+    Py_ssize_t star = -1;
+    for (Py_ssize_t i = 0; i < count; ++i) {
+        if (n->children[i]->op == PYX_IR_STAR_UNPACK) {
+            if (star >= 0) {
+                Py_DECREF(seq);
+                PyErr_SetString(PyExc_SyntaxError, "multiple starred expressions in assignment");
+                return -1;
+            }
+            star = i;
+        }
+    }
+    Py_ssize_t size = PySequence_Fast_GET_SIZE(seq);
+    if (star < 0) {
+        if (size != count) {
+            PyErr_Format(PyExc_ValueError, "not enough values to unpack (expected %zd, got %zd)", count, size);
+            if (size > count) PyErr_Format(PyExc_ValueError, "too many values to unpack (expected %zd)", count);
+            Py_DECREF(seq);
+            return -1;
+        }
+        for (Py_ssize_t i = 0; i < count; ++i) {
+            if (px_assign_target(n->children[i], g, PySequence_Fast_GET_ITEM(seq, i), s) < 0) {
+                Py_DECREF(seq); return -1;
+            }
+        }
+    } else {
+        Py_ssize_t fixed = count - 1;
+        if (size < fixed) {
+            PyErr_Format(PyExc_ValueError, "not enough values to unpack (expected at least %zd, got %zd)", fixed, size);
+            Py_DECREF(seq);
+            return -1;
+        }
+        for (Py_ssize_t i = 0; i < star; ++i) {
+            if (px_assign_target(n->children[i], g, PySequence_Fast_GET_ITEM(seq, i), s) < 0) {
+                Py_DECREF(seq); return -1;
+            }
+        }
+        PyObject *middle = PyList_New(size - fixed);
+        if (!middle) { Py_DECREF(seq); return -1; }
+        for (Py_ssize_t i = star; i < size - (count - star - 1); ++i) {
+            Py_INCREF(PySequence_Fast_GET_ITEM(seq, i));
+            PyList_SET_ITEM(middle, i - star, PySequence_Fast_GET_ITEM(seq, i));
+        }
+        if (px_assign_target(n->children[star]->left, g, middle, s) < 0) {
+            Py_DECREF(middle); Py_DECREF(seq); return -1;
+        }
+        Py_DECREF(middle);
+        for (Py_ssize_t i = star + 1; i < count; ++i) {
+            Py_ssize_t source = size - (count - i);
+            if (px_assign_target(n->children[i], g, PySequence_Fast_GET_ITEM(seq, source), s) < 0) {
+                Py_DECREF(seq); return -1;
+            }
+        }
+    }
+    Py_DECREF(seq);
+    return 0;
+}
+
 static int px_assign_target(const PyXIRNode *target, PyObject *g, PyObject *value, PXState *s)
 {
+    if (target->op == PYX_IR_UNPACK) return px_assign_unpack(target, g, value, s);
+    if (target->op == PYX_IR_STAR_UNPACK) return px_assign_target(target->left, g, value, s);
     if (target->op == PYX_IR_NAME_STORE) return PyDict_SetItem(g, target->constant, value);
     if (target->op == PYX_IR_NAME_LOAD) return PyDict_SetItem(g, target->constant, value);
     if (target->op == PYX_IR_SETATTR) {
