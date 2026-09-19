@@ -593,6 +593,37 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         return result;
     }
     case PYX_IR_CALL:return px_call(n,g,s);
+    case PYX_IR_COMPARE_CHAIN: {
+        PyObject *left=px_eval(n->children[0],g,s);
+        if(!left)return NULL;
+        for(Py_ssize_t i=0;i<n->child_count-1;++i){
+            PyObject *right=px_eval(n->children[i+1],g,s);
+            if(!right){Py_DECREF(left);return NULL;}
+            int op=(int)PyLong_AsLong(PyTuple_GET_ITEM(n->constant,i));
+            PyObject *z=NULL;
+            switch((cmpop_ty)op){
+                case Lt:z=PyObject_RichCompare(left,right,Py_LT);break;
+                case LtE:z=PyObject_RichCompare(left,right,Py_LE);break;
+                case Eq:z=PyObject_RichCompare(left,right,Py_EQ);break;
+                case NotEq:z=PyObject_RichCompare(left,right,Py_NE);break;
+                case Gt:z=PyObject_RichCompare(left,right,Py_GT);break;
+                case GtE:z=PyObject_RichCompare(left,right,Py_GE);break;
+                case Is:z=PyBool_FromLong(left==right);break;
+                case IsNot:z=PyBool_FromLong(left!=right);break;
+                case In:{int q=PySequence_Contains(right,left);z=q<0?NULL:PyBool_FromLong(q);break;}
+                case NotIn:{int q=PySequence_Contains(right,left);z=q<0?NULL:PyBool_FromLong(!q);break;}
+                default:PyErr_SetString(PyExc_NotImplementedError,"PythonX native comparison");z=NULL;
+            }
+            if(!z){Py_DECREF(left);Py_DECREF(right);return NULL;}
+            int truth=PyObject_IsTrue(z);
+            Py_DECREF(z);
+            if(truth<0){Py_DECREF(left);Py_DECREF(right);return NULL;}
+            if(!truth){Py_DECREF(left);Py_DECREF(right);return Py_NewRef(Py_False);}
+            Py_SETREF(left,right);
+        }
+        Py_DECREF(left);
+        return Py_NewRef(Py_True);
+    }
     case PYX_IR_LAMBDA:return px_lambda(n,g,s);
 
     case PYX_IR_IF: {
