@@ -511,6 +511,92 @@ fail:
     return NULL;
 }
 
+static PyObject *px_aug_apply(PyObject *left, PyObject *right, long op)
+{
+    switch ((operator_ty)op) {
+        case Add: return PyNumber_InPlaceAdd(left, right);
+        case Sub: return PyNumber_InPlaceSubtract(left, right);
+        case Mult: return PyNumber_InPlaceMultiply(left, right);
+        case MatMult: return PyNumber_InPlaceMatrixMultiply(left, right);
+        case Div: return PyNumber_InPlaceTrueDivide(left, right);
+        case FloorDiv: return PyNumber_InPlaceFloorDivide(left, right);
+        case Mod: return PyNumber_InPlaceRemainder(left, right);
+        case Pow: return PyNumber_InPlacePower(left, right, Py_None);
+        case LShift: return PyNumber_InPlaceLshift(left, right);
+        case RShift: return PyNumber_InPlaceRshift(left, right);
+        case BitOr: return PyNumber_InPlaceOr(left, right);
+        case BitXor: return PyNumber_InPlaceXor(left, right);
+        case BitAnd: return PyNumber_InPlaceAnd(left, right);
+        default:
+            PyErr_SetString(PyExc_SystemError, "invalid PythonX augmented-assignment operator");
+            return NULL;
+    }
+}
+
+static PyObject *px_aug_assign(const PyXIRNode *n, PyObject *g, PXState *s)
+{
+    long op = PyLong_AsLong(n->constant);
+    if (op == -1 && PyErr_Occurred()) return NULL;
+    const PyXIRNode *target = n->children[0];
+    PyObject *old = NULL, *value = NULL, *result = NULL;
+
+    if (target->op == PYX_IR_NAME_LOAD) {
+        old = px_eval(target, g, s);
+        if (!old) return NULL;
+        value = px_eval(n->children[1], g, s);
+        if (!value) { Py_DECREF(old); return NULL; }
+        result = px_aug_apply(old, value, op);
+        Py_DECREF(value);
+        if (!result) { Py_DECREF(old); return NULL; }
+        if (PyDict_SetItem(g, target->constant, result) < 0) {
+            Py_DECREF(old); Py_DECREF(result); return NULL;
+        }
+        Py_DECREF(old);
+        Py_DECREF(result);
+        return Py_NewRef(Py_None);
+    }
+
+    if (target->op == PYX_IR_GETATTR) {
+        PyObject *object = px_eval(target->left, g, s);
+        if (!object) return NULL;
+        old = PyObject_GetAttr(object, target->constant);
+        if (!old) { Py_DECREF(object); return NULL; }
+        value = px_eval(n->children[1], g, s);
+        if (!value) { Py_DECREF(old); Py_DECREF(object); return NULL; }
+        result = px_aug_apply(old, value, op);
+        Py_DECREF(value);
+        if (!result) { Py_DECREF(old); Py_DECREF(object); return NULL; }
+        int rc = PyObject_SetAttr(object, target->constant, result);
+        Py_DECREF(old);
+        Py_DECREF(result);
+        Py_DECREF(object);
+        return rc < 0 ? NULL : Py_NewRef(Py_None);
+    }
+
+    if (target->op == PYX_IR_SUBSCRIPT) {
+        PyObject *object = px_eval(target->children[0], g, s);
+        if (!object) return NULL;
+        PyObject *key = px_eval(target->children[1], g, s);
+        if (!key) { Py_DECREF(object); return NULL; }
+        old = PyObject_GetItem(object, key);
+        if (!old) { Py_DECREF(key); Py_DECREF(object); return NULL; }
+        value = px_eval(n->children[1], g, s);
+        if (!value) { Py_DECREF(old); Py_DECREF(key); Py_DECREF(object); return NULL; }
+        result = px_aug_apply(old, value, op);
+        Py_DECREF(value);
+        if (!result) { Py_DECREF(old); Py_DECREF(key); Py_DECREF(object); return NULL; }
+        int rc = PyObject_SetItem(object, key, result);
+        Py_DECREF(old);
+        Py_DECREF(result);
+        Py_DECREF(key);
+        Py_DECREF(object);
+        return rc < 0 ? NULL : Py_NewRef(Py_None);
+    }
+
+    PyErr_SetString(PyExc_SystemError, "invalid PythonX augmented-assignment target");
+    return NULL;
+}
+
 static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
 {
     if (!n) return Py_NewRef(Py_None);
@@ -525,6 +611,7 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         }
         return Py_NewRef(value);
     }
+    case PYX_IR_AUG_ASSIGN:return px_aug_assign(n,g,s);
     case PYX_IR_ASSIGN_CHAIN: {
         PyObject *value=px_eval(n->left,g,s);
         if(!value)return NULL;
