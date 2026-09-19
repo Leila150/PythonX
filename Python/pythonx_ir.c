@@ -323,10 +323,23 @@ static PyXIRNode *lower_stmt(stmt_ty s)
     case AsyncFor_kind:return lower_for(s,1);
     case With_kind:return lower_with(s,0);
     case AsyncWith_kind:return lower_with(s,1);
-    case Break_kind:if(px_init_signals()<0)return NULL;return ir_new(PYX_IR_BREAK);
-    case Continue_kind:if(px_init_signals()<0)return NULL;return ir_new(PYX_IR_CONTINUE);
+    case Break_kind:return ir_new(PYX_IR_BREAK);
+    case Continue_kind:return ir_new(PYX_IR_CONTINUE);
     case Delete_kind:{Py_ssize_t c=asdl_seq_LEN(s->v.Delete.targets);n=ir_new(PYX_IR_SEQUENCE);if(!n||set_children(n,c)<0){ir_free_node(n);return NULL;}for(Py_ssize_t i=0;i<c;++i){n->children[i]=lower_delete((expr_ty)asdl_seq_GET(s->v.Delete.targets,i));if(!n->children[i]){ir_free_node(n);return NULL;}}return n;}
-    case Assign_kind:{Py_ssize_t c=asdl_seq_LEN(s->v.Assign.targets);n=ir_new(PYX_IR_SEQUENCE);if(!n||set_children(n,c)<0){ir_free_node(n);return NULL;}for(Py_ssize_t i=0;i<c;++i){n->children[i]=lower_store((expr_ty)asdl_seq_GET(s->v.Assign.targets,i),lower_expr(s->v.Assign.value));if(!n->children[i]){ir_free_node(n);return NULL;}}return n;}
+    case Assign_kind:{
+        Py_ssize_t c=asdl_seq_LEN(s->v.Assign.targets);
+        if(c==1)return lower_store((expr_ty)asdl_seq_GET(s->v.Assign.targets,0),lower_expr(s->v.Assign.value));
+        n=ir_new(PYX_IR_ASSIGN_CHAIN);
+        if(!n||set_children(n,c)<0){ir_free_node(n);return NULL;}
+        n->left=lower_expr(s->v.Assign.value);
+        if(!n->left){ir_free_node(n);return NULL;}
+        for(Py_ssize_t i=0;i<c;++i){
+            expr_ty target=(expr_ty)asdl_seq_GET(s->v.Assign.targets,i);
+            n->children[i]=lower_store(target,none_node());
+            if(!n->children[i]){ir_free_node(n);return NULL;}
+        }
+        return n;
+    }
     case AnnAssign_kind:return s->v.AnnAssign.value?lower_store(s->v.AnnAssign.target,lower_expr(s->v.AnnAssign.value)):lower_expr(s->v.AnnAssign.annotation);
     case Return_kind:n=ir_new(PYX_IR_RETURN);if(!n)return NULL;n->left=s->v.Return.value?lower_expr(s->v.Return.value):none_node();if(!n->left){ir_free_node(n);return NULL;}return n;
     case Raise_kind:n=ir_new(s->v.Raise.exc?PYX_IR_RAISE:PYX_IR_RERAISE);if(!n)return NULL;if(s->v.Raise.exc){if(set_children(n,2)<0){ir_free_node(n);return NULL;}n->children[0]=lower_expr(s->v.Raise.exc);n->children[1]=s->v.Raise.cause?lower_expr(s->v.Raise.cause):none_node();if(!n->children[0]||!n->children[1]){ir_free_node(n);return NULL;}}return n;
