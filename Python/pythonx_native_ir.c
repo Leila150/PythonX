@@ -525,6 +525,15 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         }
         return Py_NewRef(value);
     }
+    case PYX_IR_ASSIGN_CHAIN: {
+        PyObject *value=px_eval(n->left,g,s);
+        if(!value)return NULL;
+        for(Py_ssize_t i=0;i<n->child_count;++i){
+            if(px_assign_target(n->children[i],g,value,s)<0){Py_DECREF(value);return NULL;}
+        }
+        Py_DECREF(value);
+        return Py_NewRef(Py_None);
+    }
     case PYX_IR_NAME_STORE: {
         PyObject *value = px_eval(n->left, g, s);
         if (!value) return NULL;
