@@ -358,6 +358,25 @@ static PyXIRNode *lower_expr(expr_ty e)
     case Attribute_kind:n=ir_new(PYX_IR_GETATTR);if(!n)return NULL;n->constant=PyUnicode_FromString(e->v.Attribute.attr);n->left=lower_expr(e->v.Attribute.value);if(!n->constant||!n->left){ir_free_node(n);return NULL;}return n;
     case Subscript_kind:n=ir_new(PYX_IR_SUBSCRIPT);if(!n||set_children(n,2)<0){ir_free_node(n);return NULL;}n->children[0]=lower_expr(e->v.Subscript.value);n->children[1]=e->v.Subscript.slice->kind==Slice_kind?lower_slice(e->v.Subscript.slice):lower_expr(e->v.Subscript.slice);if(!n->children[0]||!n->children[1]){ir_free_node(n);return NULL;}return n;
     case Slice_kind:return lower_slice(e);
+    case JoinedStr_kind:{
+        Py_ssize_t c=asdl_seq_LEN(e->v.JoinedStr.values);
+        n=ir_new(PYX_IR_FSTRING);
+        if(!n||set_children(n,c)<0){ir_free_node(n);return NULL;}
+        for(Py_ssize_t i=0;i<c;++i){
+            n->children[i]=lower_expr((expr_ty)asdl_seq_GET(e->v.JoinedStr.values,i));
+            if(!n->children[i]){ir_free_node(n);return NULL;}
+        }
+        return n;
+    }
+    case FormattedValue_kind:{
+        n=ir_new(PYX_IR_FORMAT_VALUE);
+        if(!n||set_children(n,2)<0){ir_free_node(n);return NULL;}
+        n->constant=PyLong_FromLong((long)e->v.FormattedValue.conversion);
+        n->children[0]=lower_expr(e->v.FormattedValue.value);
+        n->children[1]=e->v.FormattedValue.format_spec?lower_expr(e->v.FormattedValue.format_spec):none_node();
+        if(!n->constant||!n->children[0]||!n->children[1]){ir_free_node(n);return NULL;}
+        return n;
+    }
     case Call_kind:return lower_call(e);
     case Lambda_kind:return lower_lambda(e);
     case Await_kind:n=ir_new(PYX_IR_AWAIT);if(!n)return NULL;n->left=lower_expr(e->v.Await.value);if(!n->left){ir_free_node(n);return NULL;}return n;
