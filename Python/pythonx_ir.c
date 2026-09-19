@@ -307,7 +307,25 @@ static PyXIRNode *lower_expr(expr_ty e)
     case UnaryOp_kind:{PyXIROp op;switch(e->v.UnaryOp.op){case Invert:op=PYX_IR_INVERT;break;case UAdd:op=PYX_IR_POSITIVE;break;case USub:op=PYX_IR_NEGATIVE;break;case Not:op=PYX_IR_NOT;break;default:PyErr_SetString(PyExc_NotImplementedError,"PythonX: unary operator");return NULL;}n=ir_new(op);if(!n)return NULL;n->left=lower_expr(e->v.UnaryOp.operand);if(!n->left){ir_free_node(n);return NULL;}return n;}
     case BinOp_kind:{PyXIROp op;switch(e->v.BinOp.op){case Add:op=PYX_IR_ADD;break;case Sub:op=PYX_IR_SUB;break;case Mult:op=PYX_IR_MUL;break;case MatMult:op=PYX_IR_MATMUL;break;case Div:op=PYX_IR_DIV;break;case FloorDiv:op=PYX_IR_FLOORDIV;break;case Mod:op=PYX_IR_MOD;break;case Pow:op=PYX_IR_POW;break;case LShift:op=PYX_IR_LSHIFT;break;case RShift:op=PYX_IR_RSHIFT;break;case BitOr:op=PYX_IR_BITOR;break;case BitXor:op=PYX_IR_BITXOR;break;case BitAnd:op=PYX_IR_BITAND;break;default:PyErr_SetString(PyExc_NotImplementedError,"PythonX: binary operator");return NULL;}n=ir_new(op);if(!n)return NULL;n->left=lower_expr(e->v.BinOp.left);n->right=lower_expr(e->v.BinOp.right);if(!n->left||!n->right){ir_free_node(n);return NULL;}return n;}
     case BoolOp_kind:{Py_ssize_t c=asdl_seq_LEN(e->v.BoolOp.values);PyXIROp op=e->v.BoolOp.op==And?PYX_IR_AND:PYX_IR_OR;n=lower_expr((expr_ty)asdl_seq_GET(e->v.BoolOp.values,0));if(!n)return NULL;for(Py_ssize_t i=1;i<c;++i){PyXIRNode*r=ir_new(op);if(!r){ir_free_node(n);return NULL;}r->left=n;r->right=lower_expr((expr_ty)asdl_seq_GET(e->v.BoolOp.values,i));if(!r->right){ir_free_node(r);return NULL;}n=r;}return n;}
-    case Compare_kind:{Py_ssize_t c=asdl_seq_LEN(e->v.Compare.ops);if(c!=1){PyErr_SetString(PyExc_NotImplementedError,"PythonX: comparison-chain IR is required");return NULL;}PyXIROp op;switch((cmpop_ty)asdl_seq_GET(e->v.Compare.ops,0)){case Lt:op=PYX_IR_LT;break;case LtE:op=PYX_IR_LE;break;case Eq:op=PYX_IR_EQ;break;case NotEq:op=PYX_IR_NE;break;case Gt:op=PYX_IR_GT;break;case GtE:op=PYX_IR_GE;break;case Is:op=PYX_IR_IS;break;case IsNot:op=PYX_IR_IS_NOT;break;case In:op=PYX_IR_IN;break;case NotIn:op=PYX_IR_NOT_IN;break;default:PyErr_SetString(PyExc_NotImplementedError,"PythonX: comparison");return NULL;}n=ir_new(op);if(!n)return NULL;n->left=lower_expr(e->v.Compare.left);n->right=lower_expr((expr_ty)asdl_seq_GET(e->v.Compare.comparators,0));if(!n->left||!n->right){ir_free_node(n);return NULL;}return n;}
+    case Compare_kind:{
+        Py_ssize_t c=asdl_seq_LEN(e->v.Compare.ops);
+        n=ir_new(c==1?PYX_IR_EQ:PYX_IR_COMPARE_CHAIN);
+        if(!n)return NULL;
+        if(c==1){
+            PyXIROp op;
+            switch((cmpop_ty)asdl_seq_GET(e->v.Compare.ops,0)){case Lt:op=PYX_IR_LT;break;case LtE:op=PYX_IR_LE;break;case Eq:op=PYX_IR_EQ;break;case NotEq:op=PYX_IR_NE;break;case Gt:op=PYX_IR_GT;break;case GtE:op=PYX_IR_GE;break;case Is:op=PYX_IR_IS;break;case IsNot:op=PYX_IR_IS_NOT;break;case In:op=PYX_IR_IN;break;case NotIn:op=PYX_IR_NOT_IN;break;default:PyErr_SetString(PyExc_NotImplementedError,"PythonX: comparison");ir_free_node(n);return NULL;}
+            n->op=op;n->left=lower_expr(e->v.Compare.left);n->right=lower_expr((expr_ty)asdl_seq_GET(e->v.Compare.comparators,0));
+            if(!n->left||!n->right){ir_free_node(n);return NULL;}return n;
+        }
+        if(set_children(n,c+1)<0){ir_free_node(n);return NULL;}
+        n->children[0]=lower_expr(e->v.Compare.left);
+        for(Py_ssize_t i=0;i<c;++i)n->children[i+1]=lower_expr((expr_ty)asdl_seq_GET(e->v.Compare.comparators,i));
+        n->constant=PyTuple_New(c);
+        if(!n->constant){ir_free_node(n);return NULL;}
+        for(Py_ssize_t i=0;i<c;++i)PyTuple_SET_ITEM(n->constant,i,PyLong_FromLong((long)((cmpop_ty)asdl_seq_GET(e->v.Compare.ops,i))));
+        for(Py_ssize_t i=0;i<c;++i)if(!n->children[i]){ir_free_node(n);return NULL;}
+        return n;
+    }
     default:PyErr_Format(PyExc_NotImplementedError,"PythonX IR: unsupported expression kind %d",(int)e->kind);return NULL;
     }
 }
