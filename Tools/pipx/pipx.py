@@ -654,11 +654,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "install":
             install_package(args.package, args.version, args.os_build, [args.index_url] + args.extra_index_url if args.index_url else args.extra_index_url, args.no_deps)
         elif args.command in {"update", "upgrade"}:
+            indexes = ([args.index_url] if args.index_url else []) + args.extra_index_url
             if args.all_packages:
                 for package in installed_names():
-                    update_package(package, None, None)
+                    update_package(package, None, None, indexes or None, args.no_deps)
             elif args.package:
-                update_package(args.package, args.version, args.os_build)
+                update_package(args.package, args.version, args.os_build, indexes or None, args.no_deps)
             else:
                 raise RuntimeError("pipx: update requires <package> or --all.")
         elif args.command == "reinstall":
