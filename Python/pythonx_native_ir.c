@@ -2096,9 +2096,83 @@ static void free_exec(void*p,size_t size){
 #endif
 }
 static void capsule_free(PyObject*c){XIRNativeCode*n=PyCapsule_GetPointer(c,"PythonX.native_ir_code");if(!n){PyErr_Clear();return;}free_exec(n->code,n->size);PyXIRFunction f={n->root,n->globals};_PyX_IR_Free(&f);PyMem_RawFree(n);}
+static PyObject *px_native_const_x86(const PyXIRFunction *f)
+{
+    const PyXIRNode *root = f->root;
+    if (!root || root->op != PYX_IR_SEQUENCE || root->child_count != 1 ||
+        !root->children || !root->children[0] ||
+        root->children[0]->op != PYX_IR_CONST)
+        return NULL;
+
+    PyObject *constant = root->children[0]->constant;
+    if (!PyLong_CheckExact(constant))
+        return NULL;
+
+    int overflow = 0;
+    long long value = PyLong_AsLongLongAndOverflow(constant, &overflow);
+    if (overflow || (value == -1 && PyErr_Occurred())) {
+        PyErr_Clear();
+        return NULL;
+    }
+
+    unsigned char code[64];
+    size_t p = 0;
+
+#if defined(_WIN32)
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xEC; code[p++]=0x28;
+    code[p++]=0x48; code[p++]=0xB9;
+#else
+    code[p++]=0x48; code[p++]=0xBF;
+#endif
+    memcpy(code+p, &value, sizeof(value)); p += sizeof(value);
+    code[p++]=0x48; code[p++]=0xB8;
+    {
+        uint64_t fn=(uint64_t)(uintptr_t)&PyLong_FromLongLong;
+        memcpy(code+p,&fn,sizeof(fn)); p+=sizeof(fn);
+    }
+    code[p++]=0xFF; code[p++]=0xD0;
+#if defined(_WIN32)
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x28;
+#endif
+    code[p++]=0xC3;
+
+    void *m=alloc_exec(p);
+    if(!m){
+        PyErr_SetString(PyExc_MemoryError,"PythonX could not allocate executable memory");
+        return NULL;
+    }
+    memcpy(m,code,p);
+#if defined(_WIN32)
+    FlushInstructionCache(GetCurrentProcess(),m,p);
+#else
+    __builtin___clear_cache((char *)m,(char *)m+p);
+#endif
+
+    XIRNativeCode *n=PyMem_RawMalloc(sizeof(*n));
+    if(!n){
+        free_exec(m,p);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    n->code=m; n->size=p; n->root=NULL; n->globals=NULL;
+
+    PyObject *capsule=PyCapsule_New(n,"PythonX.native_ir_code",capsule_free);
+    if(!capsule){
+        free_exec(m,p);
+        PyMem_RawFree(n);
+        return NULL;
+    }
+    return capsule;
+}
+
 PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
 {
     if(!f||!f->root){PyErr_SetString(PyExc_TypeError,"PythonX native IR compiler requires a function");return NULL;}
+    PyObject *constant_native = px_native_const_x86(f);
+    if (constant_native)
+        return constant_native;
+    if (PyErr_Occurred())
+        return NULL;
     unsigned char code[64];size_t p=0;
 #if defined(_WIN32)
     code[p++]=0x48;code[p++]=0xB9;
