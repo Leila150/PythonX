@@ -171,7 +171,7 @@ def wheel_score(filename: str) -> int:
     return score
 
 
-def choose_distribution(data: dict[str, Any], requested: str | None) -> dict[str, Any]:
+def choose_distribution(data: dict[str, Any], requested: str | None, constraints: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     releases = data.get("releases", {})
     if requested:
         candidates = [(requested, releases.get(requested, []))]
@@ -182,6 +182,8 @@ def choose_distribution(data: dict[str, Any], requested: str | None) -> dict[str
             reverse=True,
         )
     for version, files in candidates:
+        if constraints and not version_satisfies(version, constraints):
+            continue
         wheels = [f for f in files if f.get("packagetype") == "bdist_wheel"]
         scored = sorted(
             ((wheel_score(f.get("filename", "")), f) for f in wheels),
@@ -366,29 +368,86 @@ def package_data(name: str, indexes_list: list[str]) -> tuple[dict[str, Any], st
 
 
 
-def requirement_parts(requirement: str) -> tuple[str, list[tuple[str, str]]]:
-    requirement = requirement.split(";", 1)[0].strip()
-    match = re.match(r"^([A-Za-z0-9_.-]+)\s*(.*)$", requirement)
+def requirement_parts(requirement: str) -> tuple[str, list[tuple[str, str]], str | None]:
+    marker = None
+    if ";" in requirement:
+        requirement, marker = requirement.split(";", 1)
+        marker = marker.strip() or None
+    match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[([^]]*)\])?\s*(.*)$", requirement.strip())
     if not match:
         raise RuntimeError(f"PythonX pipx: unsupported dependency: {requirement}")
-    name, spec = match.groups()
-    return name, re.findall(r"(===|==|!=|>=|<=|>|<|~=)\s*([A-Za-z0-9_.+!-]+)", spec)
+    name, extras, spec = match.groups()
+    return name, re.findall(r"(===|==|!=|>=|<=|>|<|~=)\s*([A-Za-z0-9_.+!*~-]+)", spec), marker
+
+
+def marker_matches(marker: str | None) -> bool:
+    if not marker:
+        return True
+    values = {
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "python_full_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "sys_platform": sys.platform,
+        "platform_system": platform.system(),
+        "platform_machine": platform.machine(),
+        "os_name": os.name,
+        "implementation_name": "cpython",
+    }
+    expression = marker.strip()
+    if expression in {"true", "True"}:
+        return True
+    if expression in {"false", "False"}:
+        return False
+    parts = re.split(r"\s+(and|or)\s+", expression)
+    results, operators = [], []
+    for index, part in enumerate(parts):
+        if index % 2:
+            operators.append(part)
+            continue
+        part = part.strip().strip("()")
+        match = re.match(r"""^([A-Za-z_][A-Za-z0-9_]*)\s*(===|==|!=|<=|>=|<|>|in|not\s+in)\s*["'](.*?)["']$""", part, re.I)
+        if not match:
+            raise RuntimeError(f"PythonX pipx: unsupported dependency marker: {marker}")
+        key, op, wanted = match.groups()
+        if key not in values:
+            raise RuntimeError(f"PythonX pipx: unknown dependency marker variable: {key}")
+        actual = str(values[key])
+        if op.lower() == "in":
+            result = actual in [x.strip() for x in wanted.split(",")]
+        elif op.lower() == "not in":
+            result = actual not in [x.strip() for x in wanted.split(",")]
+        elif op in {"==", "==="}: result = actual == wanted
+        elif op == "!=": result = actual != wanted
+        elif op == ">=": result = actual >= wanted
+        elif op == "<=": result = actual <= wanted
+        elif op == ">": result = actual > wanted
+        else: result = actual < wanted
+        results.append(result)
+    result = results[0]
+    for op, value in zip(operators, results[1:]):
+        result = result and value if op == "and" else result or value
+    return result
 
 
 def version_satisfies(version: str, constraints: list[tuple[str, str]]) -> bool:
     for op, wanted in constraints:
         a, b = version_key(version), version_key(wanted)
-        if op == "==" and a != b: return False
-        if op == "===" and version != wanted: return False
-        if op == "!=" and a == b: return False
-        if op == ">=" and a < b: return False
-        if op == "<=" and a > b: return False
-        if op == ">" and a <= b: return False
-        if op == "<" and a >= b: return False
+        if op == "~=":
+            if a < b:
+                return False
+            prefix = wanted.rsplit(".", 1)[0] if "." in wanted else wanted
+            if not (version == prefix or version.startswith(prefix + ".")):
+                return False
+        elif op == "==" and a != b: return False
+        elif op == "===" and version != wanted: return False
+        elif op == "!=" and a == b: return False
+        elif op == ">=" and a < b: return False
+        elif op == "<=" and a > b: return False
+        elif op == ">" and a <= b: return False
+        elif op == "<" and a >= b: return False
     return True
 
 
-def install_package(name: str, requested_version: str | None, os_build: bool, indexes_list: list[str] | None = None, no_deps: bool = False, seen: set[str] | None = None) -> None:
+def install_package(name: str, requested_version: str | None, os_build: bool, indexes_list: list[str] | None = None, no_deps: bool = False, seen: set[str] | None = None, dependency_constraints: list[tuple[str, str]] | None = None) -> None:
     indexes_list = indexes_list or [PYPI_SIMPLE]
     seen = seen or set()
     if normalize(name) in seen:
@@ -397,7 +456,7 @@ def install_package(name: str, requested_version: str | None, os_build: bool, in
     data, source_index = package_data(name, indexes_list)
     project = data.get("info", {})
     canonical = project.get("name", name)
-    distribution = choose_distribution(data, requested_version)
+    distribution = choose_distribution(data, requested_version, dependency_constraints)
 
     with tempfile.TemporaryDirectory(prefix="pythonx-pipx-") as tmp:
         tmpdir = Path(tmp)
@@ -497,13 +556,15 @@ def install_package(name: str, requested_version: str | None, os_build: bool, in
 
     if not no_deps:
         for requirement in meta.get("requires_dist", []):
-            dep_name, constraints = requirement_parts(requirement)
+            dep_name, constraints, marker = requirement_parts(requirement)
+            if not marker_matches(marker):
+                continue
             dep_meta_file = metadata_path(dep_name)
             if dep_meta_file.exists():
                 installed = load_metadata(dep_name)
                 if version_satisfies(installed.get("version", ""), constraints):
                     continue
-            install_package(dep_name, None, os_build, indexes_list, False, seen)
+            install_package(dep_name, None, os_build, indexes_list, False, seen, constraints)
 
     print(f"pipx: installed {canonical} into PythonX environment: {target}")
     if os_build:
