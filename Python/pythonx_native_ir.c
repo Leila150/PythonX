@@ -2127,6 +2127,17 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         goto emit_value;
     }
 
+    if (expr->op == PYX_IR_UNARY_MINUS || expr->op == PYX_IR_UNARY_PLUS) {
+        if (!expr->left || expr->left->op != PYX_IR_CONST ||
+            !px_native_int64(expr->left->constant, &a))
+            return NULL;
+        if (expr->op == PYX_IR_UNARY_MINUS && a == LLONG_MIN)
+            return NULL;
+        if (expr->op == PYX_IR_UNARY_MINUS)
+            a = -a;
+        goto emit_value;
+    }
+
     if (expr->left && expr->right &&
         (expr->op == PYX_IR_ADD || expr->op == PYX_IR_SUB ||
          expr->op == PYX_IR_MUL) &&
