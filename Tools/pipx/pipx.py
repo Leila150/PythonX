@@ -218,34 +218,50 @@ def extract_wheel(archive: Path, destination: Path) -> None:
         z.extractall(destination)
 
 
-def package_metadata(name: str, version: str, os_build: bool) -> dict[str, Any]:
+def package_metadata(name: str, version: str, os_build: bool, **extra: Any) -> dict[str, Any]:
     return {
         "name": name,
         "version": version,
         "pythonx": True,
         "os_build": os_build,
         "installed_by": "pipx",
+        **extra,
     }
 
 
-def check_os_compatibility(info: dict[str, Any], filename: str, wheel_metadata: dict[str, str] | None = None) -> None:
-    """
-    Conservative pre-install check.
+def metadata_path(name: str) -> Path:
+    return metadata_dir() / f"{normalize(name)}.json"
 
-    A package can opt out of PythonX OS builds by publishing the metadata
-    marker PythonX-OS-Unsupported: true. pipx also rejects distributions
-    whose wheel is explicitly tied to the current host OS when an
-    OS-independent distribution is unavailable.
-    """
+
+def load_metadata(name: str) -> dict[str, Any]:
+    path = metadata_path(name)
+    if not path.exists():
+        raise RuntimeError(f"PythonX pipx: package {name!r} is not installed.")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"PythonX pipx: invalid metadata for {name!r}: {exc}") from exc
+
+
+def installed_names() -> list[str]:
+    if not packages_dir().exists():
+        return []
+    return sorted(
+        p.name for p in packages_dir().iterdir()
+        if p.is_dir() and metadata_path(p.name).exists()
+    )
+
+
+def check_os_compatibility(info: dict[str, Any], filename: str, wheel_metadata: dict[str, str] | None = None) -> None:
+    """Reject a package explicitly marked as unsuitable for PythonX OS builds."""
     project = info.get("info", {})
     wheel_metadata = wheel_metadata or {}
     if wheel_metadata.get("PythonX-OS-Unsupported", "").strip().lower() in {"1", "true", "yes"}:
         raise RuntimeError(
-            f"PythonX pipx: {project.get("name", "package")} declares PythonX-OS support as unavailable."
+            f"PythonX pipx: {project.get('name', 'package')} declares PythonX-OS support as unavailable."
         )
-    classifiers = project.get("classifiers", []) or []
-    description = str(project.get("description", "") or "").lower()
 
+    description = str(project.get("description", "") or "").lower()
     marker = str(project.get("pythonx_os_unsupported", "")).lower()
     if marker in {"1", "true", "yes"}:
         raise RuntimeError(
@@ -261,15 +277,21 @@ def check_os_compatibility(info: dict[str, Any], filename: str, wheel_metadata: 
     )
     if any(word in description for word in host_words):
         raise RuntimeError(
-            f"PythonX pipx: {project.get('name', 'package')} declares a host-OS requirement and cannot be installed with -os."
+            f"PythonX pipx: {project.get('name', 'package')} declares a host-OS requirement "
+            "and cannot be installed with -os."
         )
 
-    if filename.endswith(".whl"):
-        match = WHEEL_RE.match(filename)
-        if match and match.group("platform") != "any":
-            # Native wheels are allowed when their runtime can be bundled;
-            # the package is recorded as platform-dependent for the OS builder.
-            return
+
+def copy_tree_contents(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in source.iterdir():
+        target = destination / item.name
+        if item.is_dir():
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(item, target)
+        else:
+            shutil.copy2(item, target)
 
 
 def install_package(name: str, requested_version: str | None, os_build: bool) -> None:
@@ -278,35 +300,39 @@ def install_package(name: str, requested_version: str | None, os_build: bool) ->
     canonical = project.get("name", name)
     distribution = choose_distribution(data, requested_version)
 
-    if os_build and distribution["packagetype"] == "bdist_wheel":
-        # Read package metadata before extraction so -os can reject it before installation.
-        with tempfile.TemporaryDirectory(prefix="pythonx-pipx-check-") as check_tmp:
-            check_archive = Path(check_tmp) / distribution["filename"]
-            download(distribution["url"], check_archive)
-            check_os_compatibility(data, distribution["filename"], read_wheel_metadata(check_archive))
-
-    target = installed_path(canonical)
-    target.parent.mkdir(parents=True, exist_ok=True)
-
     with tempfile.TemporaryDirectory(prefix="pythonx-pipx-") as tmp:
         tmpdir = Path(tmp)
         archive = tmpdir / distribution["filename"]
-        print(f"pipx: downloading {canonical} {distribution.get('version', requested_version or '')}...")
+
+        print(
+            f"pipx: downloading {canonical} "
+            f"{distribution.get('version', requested_version or '')}..."
+        )
         download(distribution["url"], archive)
-        verify_hash(archive, distribution.get("digests", {}).get("sha256") and
-                    f"sha256={distribution['digests']['sha256']}")
+        verify_hash(
+            archive,
+            distribution.get("digests", {}).get("sha256")
+            and f"sha256={distribution['digests']['sha256']}",
+        )
+
+        if os_build and distribution["packagetype"] == "bdist_wheel":
+            check_os_compatibility(
+                data,
+                distribution["filename"],
+                read_wheel_metadata(archive),
+            )
 
         staging = tmpdir / "staging"
         if distribution["packagetype"] == "bdist_wheel":
             extract_wheel(archive, staging)
         else:
             source = extract_archive(archive, staging)
-            # pipx deliberately does not compile arbitrary source packages
-            # itself. A source distribution must provide a buildable wheel
-            # through the host build backend.
             build = subprocess.run(
-                [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
-                 "--wheel-dir", str(tmpdir / "wheel"), str(source)],
+                [
+                    sys.executable, "-m", "pip", "wheel",
+                    "--no-deps", "--no-build-isolation",
+                    "--wheel-dir", str(tmpdir / "wheel"), str(source),
+                ],
                 text=True,
                 capture_output=True,
             )
@@ -321,13 +347,22 @@ def install_package(name: str, requested_version: str | None, os_build: bool) ->
             staging = tmpdir / "wheel-staging"
             extract_wheel(built[0], staging)
 
+        target = installed_path(canonical)
+        packages_dir().mkdir(parents=True, exist_ok=True)
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(staging, target)
 
-    meta = package_metadata(canonical, project.get("version", requested_version or ""), os_build)
     metadata_dir().mkdir(parents=True, exist_ok=True)
-    (metadata_dir() / f"{normalize(canonical)}.json").write_text(
+    meta = package_metadata(
+        canonical,
+        project.get("version", requested_version or ""),
+        os_build,
+        summary=project.get("summary", ""),
+        requires_dist=project.get("requires_dist", []) or [],
+        distribution=distribution["filename"],
+    )
+    metadata_path(canonical).write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
@@ -336,42 +371,62 @@ def install_package(name: str, requested_version: str | None, os_build: bool) ->
         print("pipx: marked for PythonX OS build.")
 
 
-def list_packages() -> None:
-    directory = packages_dir()
-    if not directory.exists():
-        print("pipx: no packages installed.")
-        return
-    items = sorted(p for p in directory.iterdir() if p.is_dir())
-    if not items:
-        print("pipx: no packages installed.")
-        return
-    for item in items:
-        meta_file = metadata_dir() / f"{item.name}.json"
-        version = ""
-        os_build = False
-        if meta_file.exists():
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            version = str(meta.get("version", ""))
-            os_build = bool(meta.get("os_build", False))
-        suffix = " [OS]" if os_build else ""
-        print(f"{item.name} {version}{suffix}")
-
-
 def uninstall(name: str) -> None:
-    target = installed_path(name)
+    meta = load_metadata(name)
+    target = installed_path(meta["name"])
+    if target.exists():
+        shutil.rmtree(target)
+    metadata_path(meta["name"]).unlink(missing_ok=True)
+    print(f"pipx: removed {meta['name']}")
+
+
+def edit_package(name: str) -> None:
+    meta = load_metadata(name)
+    target = installed_path(meta["name"])
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    if not editor:
+        editor = "notepad" if os.name == "nt" else "nano"
+    try:
+        subprocess.run([editor, str(target)], check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"PythonX pipx: editor {editor!r} was not found. "
+            "Set EDITOR or VISUAL to your preferred editor."
+        ) from exc
+
+
+def show_package(name: str) -> None:
+    meta = load_metadata(name)
+    print(json.dumps(meta, indent=2, sort_keys=True))
+
+
+def files_package(name: str) -> None:
+    meta = load_metadata(name)
+    target = installed_path(meta["name"])
     if not target.exists():
-        raise RuntimeError(f"pipx: package {name!r} is not installed.")
-    shutil.rmtree(target)
-    meta = metadata_dir() / f"{normalize(name)}.json"
-    meta.unlink(missing_ok=True)
-    print(f"pipx: removed {name}")
+        raise RuntimeError(f"PythonX pipx: package files are missing for {name!r}.")
+    for path in sorted(target.rglob("*")):
+        if path.is_file():
+            print(path.relative_to(target))
 
 
-def show_environment() -> None:
-    print(f"PythonX home: {home()}")
-    print(f"PythonX packages: {packages_dir()}")
-    print(f"PythonX metadata: {metadata_dir()}")
-    print(f"Python executable: {sys.executable}")
+def verify_package(name: str) -> None:
+    meta = load_metadata(name)
+    target = installed_path(meta["name"])
+    if not target.exists():
+        raise RuntimeError(f"PythonX pipx: package files are missing for {name!r}.")
+    py_files = list(target.rglob("*.py"))
+    print(f"pipx: {meta['name']} {meta.get('version', '')} is installed.")
+    print(f"pipx: {len(py_files)} Python source files found.")
+    print(f"pipx: OS build package: {'yes' if meta.get('os_build') else 'no'}")
+
+
+def clear_packages() -> None:
+    if packages_dir().exists():
+        shutil.rmtree(packages_dir())
+    if metadata_dir().exists():
+        shutil.rmtree(metadata_dir())
+    print("pipx: cleared the PythonX third-party package environment.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -384,28 +439,52 @@ def main(argv: list[str] | None = None) -> int:
     install = sub.add_parser("install", help="Install PythonX or a third-party package.")
     install.add_argument("package")
     install.add_argument("--version", "-v", dest="version")
-    install.add_argument("-os", "--os", action="store_true",
-                          dest="os_build",
-                          help="Install for a PythonX OS build; reject host-OS-dependent packages.")
+    install.add_argument(
+        "-os", "--os", action="store_true", dest="os_build",
+        help="Install for a PythonX OS build; reject host-OS-dependent packages.",
+    )
 
-    sub.add_parser("list", help="List installed PythonX packages.")
+    sub.add_parser("list", aliases=["ls"], help="List installed packages.")
 
-    remove = sub.add_parser("remove", aliases=["uninstall"], help="Remove an installed package.")
+    remove = sub.add_parser("remove", aliases=["uninstall", "rm"], help="Uninstall a package.")
     remove.add_argument("package")
 
+    edit = sub.add_parser("edit", help="Open an installed package in the configured editor.")
+    edit.add_argument("package")
+
+    show = sub.add_parser("show", aliases=["info"], help="Show package metadata.")
+    show.add_argument("package")
+
+    files = sub.add_parser("files", help="List files installed by a package.")
+    files.add_argument("package")
+
+    verify = sub.add_parser("verify", help="Verify that a package installation is present.")
+    verify.add_argument("package")
+
     sub.add_parser("environment", aliases=["env"], help="Show the active PythonX environment.")
+    sub.add_parser("clear", help="Remove all third-party packages from the environment.")
 
     args = parser.parse_args(argv)
 
     try:
         if args.command == "install":
             install_package(args.package, args.version, args.os_build)
-        elif args.command == "list":
+        elif args.command in {"list", "ls"}:
             list_packages()
-        elif args.command in {"remove", "uninstall"}:
+        elif args.command in {"remove", "uninstall", "rm"}:
             uninstall(args.package)
+        elif args.command == "edit":
+            edit_package(args.package)
+        elif args.command in {"show", "info"}:
+            show_package(args.package)
+        elif args.command == "files":
+            files_package(args.package)
+        elif args.command == "verify":
+            verify_package(args.package)
         elif args.command in {"environment", "env"}:
             show_environment()
+        elif args.command == "clear":
+            clear_packages()
         return 0
     except (urllib.error.HTTPError, urllib.error.URLError) as exc:
         print(f"pipx: network error: {exc}", file=sys.stderr)
