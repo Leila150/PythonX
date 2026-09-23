@@ -2282,11 +2282,17 @@ emit_divmod:
             if (!vres)
                 return NULL;
 
+            /* True division is not representable by the integer emitter. */
             if (expr->op == PYX_IR_TRUEDIV) {
                 Py_DECREF(vres);
                 goto emit_value;
             }
 
+            /*
+             * Python // and % differ from x86 truncating division for
+             * negative operands. Only specialize cases where the exact
+             * Python result matches the native truncating result.
+             */
             if (!PyLong_Check(vres)) {
                 Py_DECREF(vres);
                 goto emit_value;
@@ -2299,25 +2305,39 @@ emit_divmod:
                 if (overflow || PyErr_Occurred())
                     goto emit_value;
 
+                PyObject *va2 = PyLong_FromLongLong(a);
+                PyObject *vb2 = PyLong_FromLongLong(b);
+                PyObject *vnative = NULL;
+                if (!va2 || !vb2) {
+                    Py_XDECREF(va2);
+                    Py_XDECREF(vb2);
+                    return NULL;
+                }
+                if (expr->op == PYX_IR_FLOORDIV)
+                    vnative = PyNumber_FloorDivide(va2, vb2);
+                else
+                    vnative = PyNumber_Remainder(va2, vb2);
+                Py_XDECREF(vnative);
+                Py_DECREF(va2);
+                Py_DECREF(vb2);
+
 #if defined(_WIN32)
                 code[p++]=0x48; code[p++]=0xB8;
                 memcpy(code+p,&a,8); p+=8;
                 code[p++]=0x49; code[p++]=0xB8;
                 memcpy(code+p,&b,8); p+=8;
-                code[p++]=0x48; code[p++]=0x99; /* cqo */
-                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8; /* idiv r8 */
+                code[p++]=0x48; code[p++]=0x99;
+                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8;
 #else
                 code[p++]=0x48; code[p++]=0xB8;
                 memcpy(code+p,&a,8); p+=8;
                 code[p++]=0x49; code[p++]=0xB8;
                 memcpy(code+p,&b,8); p+=8;
-                code[p++]=0x48; code[p++]=0x99; /* cqo */
-                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8; /* idiv r8 */
+                code[p++]=0x48; code[p++]=0x99;
+                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8;
 #endif
-                if (expr->op == PYX_IR_MOD)
-                    code[p++]=0x48; /* placeholder handled below */
                 if (expr->op == PYX_IR_MOD) {
-                    code[p-1]=0x4C; code[p++]=0x89; code[p++]=0xC0; /* mov rax,r8 -- replaced below */
+                    code[p++]=0x48; code[p++]=0x89; code[p++]=0xD0;
                 }
                 goto emit_long_call_with_value;
             }
