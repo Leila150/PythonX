@@ -408,11 +408,75 @@ static PyXIRNode *lower_expr(expr_ty e)
     }
 }
 
+static PyXIRNode *lower_function(stmt_ty s)
+{
+    PyXIRNode *n = ir_new(PYX_IR_FUNCTION);
+    if (!n) return NULL;
+
+    arguments_ty a = s->v.FunctionDef.args;
+    Py_ssize_t np = asdl_seq_LEN(a->posonlyargs) + asdl_seq_LEN(a->args);
+    Py_ssize_t nk = asdl_seq_LEN(a->kwonlyargs);
+    Py_ssize_t nd = asdl_seq_LEN(a->defaults);
+    PyObject *meta = PyTuple_New(7);
+    PyObject *names = PyTuple_New(np + nk);
+    if (!meta || !names) {
+        Py_XDECREF(meta);
+        Py_XDECREF(names);
+        ir_free_node(n);
+        return NULL;
+    }
+
+    PyTuple_SET_ITEM(meta, 0, PyLong_FromSsize_t(asdl_seq_LEN(a->posonlyargs)));
+    PyTuple_SET_ITEM(meta, 1, PyLong_FromSsize_t(asdl_seq_LEN(a->args)));
+    PyTuple_SET_ITEM(meta, 2, PyLong_FromSsize_t(nk));
+    PyTuple_SET_ITEM(meta, 3, a->vararg ? PyUnicode_FromString(a->vararg->arg) : Py_NewRef(Py_None));
+    PyTuple_SET_ITEM(meta, 4, a->kwarg ? PyUnicode_FromString(a->kwarg->arg) : Py_NewRef(Py_None));
+    PyTuple_SET_ITEM(meta, 5, names);
+    PyTuple_SET_ITEM(meta, 6, PyUnicode_FromString(s->v.FunctionDef.name));
+
+    Py_ssize_t j = 0;
+    for (Py_ssize_t i = 0; i < asdl_seq_LEN(a->posonlyargs); ++i)
+        PyTuple_SET_ITEM(names, j++, PyUnicode_FromString(((arg_ty)asdl_seq_GET(a->posonlyargs, i))->arg));
+    for (Py_ssize_t i = 0; i < asdl_seq_LEN(a->args); ++i)
+        PyTuple_SET_ITEM(names, j++, PyUnicode_FromString(((arg_ty)asdl_seq_GET(a->args, i))->arg));
+    for (Py_ssize_t i = 0; i < nk; ++i)
+        PyTuple_SET_ITEM(names, j++, PyUnicode_FromString(((arg_ty)asdl_seq_GET(a->kwonlyargs, i))->arg));
+
+    n->constant = meta;
+    n->left = lower_suite(s->v.FunctionDef.body);
+    if (!n->left) {
+        ir_free_node(n);
+        return NULL;
+    }
+
+    if (set_children(n, nd + nk) < 0) {
+        ir_free_node(n);
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < nd; ++i) {
+        n->children[i] = lower_expr((expr_ty)asdl_seq_GET(a->defaults, i));
+        if (!n->children[i]) {
+            ir_free_node(n);
+            return NULL;
+        }
+    }
+    for (Py_ssize_t i = 0; i < nk; ++i) {
+        expr_ty d = (expr_ty)asdl_seq_GET(a->kw_defaults, i);
+        n->children[nd + i] = d ? lower_expr(d) : NULL;
+        if (d && !n->children[nd + i]) {
+            ir_free_node(n);
+            return NULL;
+        }
+    }
+    return n;
+}
+
 static PyXIRNode *lower_stmt(stmt_ty s)
 {
     PyXIRNode *n;
     switch(s->kind){
     case Expr_kind:return lower_expr(s->v.Expr.value);
+    case FunctionDef_kind:return lower_function(s);
     case If_kind:return lower_if(s);
     case While_kind:return lower_while(s);
     case For_kind:return lower_for(s,0);
