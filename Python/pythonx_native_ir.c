@@ -2,6 +2,7 @@
 #include "pythonx_ir.h"
 #include "pythonx_native_ir.h"
 #include "pythonx_error_statements.h"
+#include "pycore_pythonxobject.h"
 #include <structmember.h>
 #include <stdint.h>
 #include <string.h>
@@ -422,11 +423,24 @@ static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
         return NULL;
     }
 
-    PyObject *bases = PyTuple_New(nb);
+    /*
+     * PythonX classes have a native PythonX object root when no explicit
+     * bases are supplied.  This makes instances PythonX objects rather than
+     * merely ordinary object subclasses, while explicit Python bases retain
+     * normal Python multiple-inheritance semantics.
+     */
+    if (PyType_Ready(&PyXObject_Type) < 0)
+        return NULL;
+
+    Py_ssize_t effective_bases = nb == 0 ? 1 : nb;
+    PyObject *bases = PyTuple_New(effective_bases);
     PyObject *namespace = PyDict_New();
     if (!bases || !namespace) {
         Py_XDECREF(bases); Py_XDECREF(namespace); return NULL;
     }
+
+    if (nb == 0)
+        PyTuple_SET_ITEM(bases, 0, Py_NewRef((PyObject *)&PyXObject_Type));
 
     for (Py_ssize_t i = 0; i < nb; ++i) {
         PyObject *base = px_eval(n->children[i], g, s);
