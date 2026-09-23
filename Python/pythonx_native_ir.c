@@ -79,6 +79,7 @@ typedef struct {
     PyObject *qualname;
     PyObject *module;
     PyObject *doc;
+    PyObject *parent;
     int is_async;
 } PyXFunctionObject;
 
@@ -96,6 +97,7 @@ static void px_function_dealloc(PyXFunctionObject *fn)
     Py_XDECREF(fn->qualname);
     Py_XDECREF(fn->module);
     Py_XDECREF(fn->doc);
+    Py_XDECREF(fn->parent);
     Py_TYPE(fn)->tp_free((PyObject *)fn);
 }
 
@@ -146,15 +148,9 @@ static PyObject *px_function_call(PyObject *self, PyObject *args, PyObject *kwar
     if (PyDict_SetItemString(locals, "__pythonx_globals__", fn->globals) < 0) goto error;
     
     /* Nested PythonX functions can read names from their defining scope. */
-    PyObject *parent = PyObject_GetAttrString(self, "__pythonx_parent__");
-    if (parent) {
-        if (PyDict_SetItemString(locals, "__pythonx_parent__", parent) < 0) {
-            Py_DECREF(parent);
+    if (fn->parent) {
+        if (PyDict_SetItemString(locals, "__pythonx_parent__", fn->parent) < 0)
             goto error;
-        }
-        Py_DECREF(parent);
-    } else {
-        PyErr_Clear();
     }
 
     /* Positional-only and normal positional parameters. */
@@ -310,6 +306,7 @@ static PyMemberDef px_function_members[] = {
     {"__defaults__", T_OBJECT_EX, offsetof(PyXFunctionObject, defaults), 0, NULL},
     {"__kwdefaults__", T_OBJECT_EX, offsetof(PyXFunctionObject, kwdefaults), 0, NULL},
     {"__annotations__", T_OBJECT_EX, offsetof(PyXFunctionObject, annotations), 0, NULL},
+    {"__pythonx_parent__", T_OBJECT_EX, offsetof(PyXFunctionObject, parent), READONLY, NULL},
     {NULL}
 };
 
@@ -411,6 +408,7 @@ static PyObject *px_function(const PyXIRNode *n, PyObject *g, PXState *s)
         fn->module = m ? Py_NewRef(m) : Py_NewRef(Py_None);
     } else fn->module = Py_NewRef(module);
     fn->doc = Py_NewRef(doc);
+    fn->parent = (g && PyDict_Check(g) && PyDict_GetItemString(g, "__pythonx_globals__")) ? Py_NewRef(g) : NULL;
     fn->is_async = is_async;
 
     /*
