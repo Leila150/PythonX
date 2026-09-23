@@ -1684,29 +1684,25 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
             PyObject *item = PyTuple_GET_ITEM(items, i);
             PyObject *module_name = PyTuple_GET_ITEM(item, 0);
             PyObject *asname = PyTuple_GET_ITEM(item, 1);
-            PyObject *module = PyImport_Import(module_name);
+            PyObject *module = PyImport_ImportModule(PyUnicode_AsUTF8(module_name));
             if (!module) return NULL;
-            PyObject *bind = asname != Py_None ? asname : module_name;
-            PyObject *dot = PyUnicode_FindChar(bind, '.', 0, PyUnicode_GET_LENGTH(bind), 1);
-            PyObject *name = NULL;
-            if (asname == Py_None && dot != Py_None) {
-                name = PyUnicode_Substring(bind, 0, PyUnicode_GET_LENGTH(bind));
-            }
+
+            PyObject *bind = asname;
+            PyObject *top_name = NULL;
             if (asname == Py_None) {
-                Py_ssize_t pos = PyUnicode_FindChar(bind, '.', 0, PyUnicode_GET_LENGTH(bind), 1);
-                if (pos >= 0) {
-                    Py_DECREF(module);
-                    module = PyImport_Import(PyUnicode_Substring(bind, 0, pos));
-                    if (!module) return NULL;
-                    bind = PyTuple_GET_ITEM(item, 0);
-                    Py_INCREF(module);
-                    Py_DECREF(module);
-                    module = PyImport_Import(PyUnicode_Substring(bind, 0, pos));
-                    if (!module) return NULL;
-                }
+                Py_ssize_t dot = PyUnicode_FindChar(
+                    module_name, '.', 0, PyUnicode_GET_LENGTH(module_name), 1);
+                top_name = dot >= 0
+                    ? PyUnicode_Substring(module_name, 0, dot)
+                    : Py_NewRef(module_name);
+                bind = top_name;
+            } else {
+                Py_INCREF(bind);
             }
+
             int rc = PyDict_SetItem(g, bind, module);
-            Py_XDECREF(name);
+            Py_DECREF(bind);
+            Py_XDECREF(top_name);
             Py_DECREF(module);
             if (rc < 0) return NULL;
         }
@@ -1717,22 +1713,59 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         PyObject *module_name = PyTuple_GET_ITEM(meta, 0);
         long level = PyLong_AsLong(PyTuple_GET_ITEM(meta, 1));
         if (level == -1 && PyErr_Occurred()) return NULL;
-        PyObject *module = module_name == Py_None ? PyUnicode_FromString("") : Py_NewRef(module_name);
-        if (!module) return NULL;
-        PyObject *pkg = PyImport_Import(module);
-        Py_DECREF(module);
+
+        PyObject *fromlist = PyTuple_New(1);
+        if (!fromlist) return NULL;
+        PyObject *first = PyTuple_GET_ITEM(PyTuple_GET_ITEM(meta, 2), 0);
+        Py_INCREF(first);
+        PyTuple_SET_ITEM(fromlist, 0, first);
+
+        PyObject *pkg = PyImport_ImportModuleLevelObject(
+            module_name == Py_None ? Py_None : module_name,
+            g, g, fromlist, (int)level);
+        Py_DECREF(fromlist);
         if (!pkg) return NULL;
+
         Py_ssize_t count = PyTuple_GET_SIZE(meta) - 2;
         for (Py_ssize_t i = 0; i < count; ++i) {
             PyObject *item = PyTuple_GET_ITEM(meta, i + 2);
             PyObject *name = PyTuple_GET_ITEM(item, 0);
             PyObject *asname = PyTuple_GET_ITEM(item, 1);
+
             if (PyUnicode_CompareWithASCIIString(name, "*") == 0) {
-                PyObject *dict = PyModule_GetDict(pkg);
-                if (!dict) { Py_DECREF(pkg); return NULL; }
-                if (PyDict_Update(g, dict) < 0) { Py_DECREF(pkg); return NULL; }
+                PyObject *all = PyObject_GetAttrString(pkg, "__all__");
+                if (all) {
+                    PyObject *seq = PySequence_Fast(all, "__all__ must be iterable");
+                    Py_DECREF(all);
+                    if (!seq) { Py_DECREF(pkg); return NULL; }
+                    Py_ssize_t size = PySequence_Fast_GET_SIZE(seq);
+                    for (Py_ssize_t j = 0; j < size; ++j) {
+                        PyObject *key = PySequence_Fast_GET_ITEM(seq, j);
+                        PyObject *value = PyObject_GetAttr(pkg, key);
+                        if (!value || PyDict_SetItem(g, key, value) < 0) {
+                            Py_XDECREF(value);
+                            Py_DECREF(seq);
+                            Py_DECREF(pkg);
+                            return NULL;
+                        }
+                        Py_DECREF(value);
+                    }
+                    Py_DECREF(seq);
+                } else {
+                    if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                        Py_DECREF(pkg);
+                        return NULL;
+                    }
+                    PyErr_Clear();
+                    PyObject *dict = PyModule_GetDict(pkg);
+                    if (!dict || PyDict_Update(g, dict) < 0) {
+                        Py_DECREF(pkg);
+                        return NULL;
+                    }
+                }
                 continue;
             }
+
             PyObject *value = PyObject_GetAttr(pkg, name);
             if (!value) { Py_DECREF(pkg); return NULL; }
             PyObject *bind = asname != Py_None ? asname : name;
