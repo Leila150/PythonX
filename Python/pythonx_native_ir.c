@@ -2170,8 +2170,14 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             vres = PyNumber_Add(va, vb);
         else if (expr->op == PYX_IR_SUB)
             vres = PyNumber_Subtract(va, vb);
-        else
+        else if (expr->op == PYX_IR_MUL)
             vres = PyNumber_Multiply(va, vb);
+        else if (expr->op == PYX_IR_LSHIFT)
+            vres = PyNumber_Lshift(va, vb);
+        else if (expr->op == PYX_IR_RSHIFT)
+            vres = PyNumber_Rshift(va, vb);
+        else
+            vres = NULL;
         Py_DECREF(va);
         Py_DECREF(vb);
         if (!vres)
@@ -2201,10 +2207,13 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         } else if (expr->op == PYX_IR_BITAND) {
             code[p++]=0x4C; code[p++]=0x21; code[p++]=0xC0; /* and rax, r8 */
         } else if (expr->op == PYX_IR_LSHIFT) {
-            code[p++]=0x49; code[p++]=0xD3; code[p++]=0xE0; /* shl rax, r8b */
-        } else {
-            code[p++]=0x49; code[p++]=0xD3; code[p++]=0xF8; /* sar rax, r8b */
-        }
+            code[p++]=0x41; code[p++]=0x88; code[p++]=0xF0; /* mov r8b, sil */
+            code[p++]=0x44; code[p++]=0x89; code[p++]=0xC1; /* mov ecx, r8d */
+            code[p++]=0x48; code[p++]=0xD3; code[p++]=0xE0; /* shl rax, cl */
+        } else if (expr->op == PYX_IR_RSHIFT) {
+            code[p++]=0x41; code[p++]=0x88; code[p++]=0xF0; /* mov r8b, sil */
+            code[p++]=0x44; code[p++]=0x89; code[p++]=0xC1; /* mov ecx, r8d */
+            code[p++]=0x48; code[p++]=0xD3; code[p++]=0xF8; /* sar rax, cl */
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC1; /* mov rcx, rax */
 #else
         /* System V AMD64: RDI is the first argument to PyLong_FromLongLong. */
@@ -2222,8 +2231,14 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             code[p++]=0x4C; code[p++]=0x09; code[p++]=0xC0; /* or rax, r8 */
         } else if (expr->op == PYX_IR_BITXOR) {
             code[p++]=0x4C; code[p++]=0x31; code[p++]=0xC0; /* xor rax, r8 */
-        } else {
+        } else if (expr->op == PYX_IR_BITAND) {
             code[p++]=0x4C; code[p++]=0x21; code[p++]=0xC0; /* and rax, r8 */
+        } else if (expr->op == PYX_IR_LSHIFT) {
+            code[p++]=0x44; code[p++]=0x89; code[p++]=0xC1; /* mov ecx, r8d */
+            code[p++]=0x48; code[p++]=0xD3; code[p++]=0xE0; /* shl rax, cl */
+        } else {
+            code[p++]=0x44; code[p++]=0x89; code[p++]=0xC1; /* mov ecx, r8d */
+            code[p++]=0x48; code[p++]=0xD3; code[p++]=0xF8; /* sar rax, cl */
         }
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7; /* mov rdi, rax */
 #endif
