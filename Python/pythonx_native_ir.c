@@ -80,12 +80,19 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
     PyObject *vararg_name = PyTuple_GET_ITEM(meta, 3);
     PyObject *kwarg_name = PyTuple_GET_ITEM(meta, 4);
     PyObject *names = PyTuple_GET_ITEM(meta, 5);
+    PyObject *callable_name = PyTuple_GET_SIZE(meta) > 6 ? PyTuple_GET_ITEM(meta, 6) : PyUnicode_FromString("<lambda>");
+    int owns_callable_name = PyTuple_GET_SIZE(meta) <= 6;
+    const char *kind_name = PyUnicode_Check(callable_name) ? PyUnicode_AsUTF8(callable_name) : "<function>";
+    if (!kind_name) {
+        if (owns_callable_name) Py_DECREF(callable_name);
+        return NULL;
+    }
     Py_ssize_t total_pos = posonly + positional;
 
     if (posonly < 0 || positional < 0 || kwonly < 0) return NULL;
     if (PyTuple_GET_SIZE(args) > total_pos && vararg_name == Py_None) {
-        PyErr_Format(PyExc_TypeError, "<lambda>() takes %zd positional arguments but %zd were given",
-                     total_pos, PyTuple_GET_SIZE(args));
+        PyErr_Format(PyExc_TypeError, "%s() takes %zd positional arguments but %zd were given",
+                     kind_name, total_pos, PyTuple_GET_SIZE(args));
         return NULL;
     }
 
@@ -98,7 +105,7 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         if (i < PyTuple_GET_SIZE(args)) {
             value = PyTuple_GET_ITEM(args, i);
             if (kwargs && PyDict_GetItemWithError(kwargs, name)) {
-                PyErr_Format(PyExc_TypeError, "<lambda>() got multiple values for argument '%U'", name);
+                PyErr_Format(PyExc_TypeError, "%s() got multiple values for argument '%U'", kind_name, name);
                 goto error;
             }
         } else if (kwargs) value = PyDict_GetItemWithError(kwargs, name);
@@ -108,11 +115,11 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
             if (default_index >= 0) value = PyTuple_GET_ITEM(c->defaults, default_index);
         }
         if (!value) {
-            PyErr_Format(PyExc_TypeError, "<lambda>() missing required argument: '%U'", name);
+            PyErr_Format(PyExc_TypeError, "%s() missing required argument: '%U'", kind_name, name);
             goto error;
         }
         if (i < posonly && kwargs && PyDict_GetItemWithError(kwargs, name)) {
-            PyErr_Format(PyExc_TypeError, "<lambda>() got some positional-only arguments passed as keyword arguments: '%U'", name);
+            PyErr_Format(PyExc_TypeError, "%s() got some positional-only arguments passed as keyword arguments: '%U'", name);
             goto error;
         }
         if (PyDict_SetItem(locals, name, value) < 0) goto error;
@@ -131,7 +138,7 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         if (!value && PyErr_Occurred()) goto error;
         if (!value && c->kwdefaults) value = PyDict_GetItemWithError(c->kwdefaults, name);
         if (!value) {
-            PyErr_Format(PyExc_TypeError, "<lambda>() missing required keyword-only argument: '%U'", name);
+            PyErr_Format(PyExc_TypeError, "%s() missing required keyword-only argument: '%U'", kind_name, name);
             goto error;
         }
         if (PyDict_SetItem(locals, name, value) < 0) goto error;
@@ -157,10 +164,18 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
 
     PXState state = {PX_NORMAL, 0};
     PyObject *result = px_eval(n->left, locals, &state);
+    if (result && state.flow == PX_RETURN) {
+        /* Return is intentionally not part of the first def/call milestone.
+           Keep the existing runtime path isolated so later return support can
+           be added without changing function construction/calling. */
+        state.flow = PX_NORMAL;
+    }
     Py_DECREF(locals);
+    if (owns_callable_name) Py_DECREF(callable_name);
     return result;
 error:
     Py_DECREF(locals);
+    if (owns_callable_name) Py_DECREF(callable_name);
     return NULL;
 }
 
@@ -168,7 +183,7 @@ static PyMethodDef px_lambda_method = {
     "lambda", (PyCFunction)(void(*)(void))px_lambda_call, METH_VARARGS | METH_KEYWORDS, NULL
 };
 
-static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
+static PyObject *px_function(const PyXIRNode *n, PyObject *g, PXState *s)
 {
     PyObject *defaults = PyTuple_New(0);
     PyObject *kwdefaults = PyDict_New();
@@ -217,7 +232,13 @@ static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
     }
     PyObject *fn = PyCFunction_NewEx(&px_lambda_method, capsule, NULL);
     Py_DECREF(capsule);
+    if (!fn) return NULL;
     return fn;
+}
+
+static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
+{
+    return px_function(n, g, s);
 }
 
 
@@ -884,6 +905,14 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         Py_DECREF(iterator);
         PyErr_SetNone(PyExc_StopIteration);
         return NULL;
+    }
+    case PYX_IR_FUNCTION: {
+        PyObject *fn = px_function(n, g, s);
+        if (!fn) return NULL;
+        PyObject *name = PyTuple_GET_ITEM(n->constant, 6);
+        int rc = PyDict_SetItem(g, name, fn);
+        Py_DECREF(fn);
+        return rc < 0 ? NULL : Py_NewRef(Py_None);
     }
     case PYX_IR_LAMBDA:return px_lambda(n,g,s);
 
