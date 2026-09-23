@@ -2258,12 +2258,24 @@ emit_value:
     memcpy(code+p,&a,8); p+=8;
 
 emit_call:
+#if defined(_WIN32)
+    /* Windows x64: reserve 32-byte shadow space and align RSP for the call. */
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xEC; code[p++]=0x28; /* sub rsp, 40 */
+#else
+    /* System V AMD64: align RSP to 16 bytes before the call. */
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xEC; code[p++]=0x08; /* sub rsp, 8 */
+#endif
     code[p++]=0x48; code[p++]=0xB8;
     {
         uint64_t fn=(uint64_t)(uintptr_t)&PyLong_FromLongLong;
         memcpy(code+p,&fn,8); p+=8;
     }
     code[p++]=0xFF; code[p++]=0xD0;
+#if defined(_WIN32)
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x28; /* add rsp, 40 */
+#else
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x08; /* add rsp, 8 */
+#endif
     code[p++]=0xC3;
 
     void *m=alloc_exec(p);
