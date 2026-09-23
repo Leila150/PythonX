@@ -102,6 +102,101 @@ static void px_function_dealloc(PyXFunctionObject *fn)
     Py_TYPE(fn)->tp_free((PyObject *)fn);
 }
 
+static PyObject *px_function_descr_get(PyObject *self, PyObject *obj, PyObject *type)
+{
+    Py_UNUSED(type);
+    if (!obj || obj == Py_None)
+        return Py_NewRef(self);
+    return PyMethod_New(self, obj);
+}
+
+static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
+{
+    PyObject *meta = n->constant;
+    PyObject *name = PyTuple_GET_ITEM(meta, 0);
+    Py_ssize_t nb = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 1));
+    PyObject *kw_names = PyTuple_GET_ITEM(meta, 2);
+    Py_ssize_t nd = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 3));
+    if (nb < 0 || nd < 0) {
+        PyErr_SetString(PyExc_SystemError, "invalid PythonX class metadata");
+        return NULL;
+    }
+
+    PyObject *bases = PyTuple_New(nb);
+    PyObject *namespace = PyDict_New();
+    if (!bases || !namespace) {
+        Py_XDECREF(bases); Py_XDECREF(namespace); return NULL;
+    }
+
+    for (Py_ssize_t i = 0; i < nb; ++i) {
+        PyObject *base = px_eval(n->children[i], g, s);
+        if (!base) { Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
+        PyTuple_SET_ITEM(bases, i, base);
+    }
+
+    /*
+     * Execute the class suite in its own namespace.  FunctionDef stores
+     * methods in this namespace, so a method named __init__ becomes a real
+     * descriptor on the resulting Python type.  Python's type machinery then
+     * automatically calls __init__(self, ...) when an instance is created.
+     */
+    if (PyDict_SetItemString(namespace, "__module__",
+                             PyDict_GetItemString(g, "__name__") ?
+                             PyDict_GetItemString(g, "__name__") : Py_None) < 0) {
+        Py_DECREF(bases); Py_DECREF(namespace); return NULL;
+    }
+    PyObject *body_result = px_eval(n->left, namespace, s);
+    if (!body_result) { Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
+    Py_DECREF(body_result);
+
+    PyObject *kwargs = PyDict_New();
+    if (!kwargs) { Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
+    Py_ssize_t nk = PyTuple_GET_SIZE(kw_names);
+    for (Py_ssize_t i = 0; i < nk; ++i) {
+        PyObject *key = PyTuple_GET_ITEM(kw_names, i);
+        PyObject *value = px_eval(n->children[nb + i], g, s);
+        if (!value) { Py_DECREF(kwargs); Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
+        if (key == Py_None) {
+            /* **class_kwargs */
+            if (PyDict_Update(kwargs, value) < 0) {
+                Py_DECREF(value); Py_DECREF(kwargs); Py_DECREF(bases); Py_DECREF(namespace); return NULL;
+            }
+        } else if (PyDict_SetItem(kwargs, key, value) < 0) {
+            Py_DECREF(value); Py_DECREF(kwargs); Py_DECREF(bases); Py_DECREF(namespace); return NULL;
+        }
+        Py_DECREF(value);
+    }
+
+    PyObject *type_obj = (PyObject *)&PyType_Type;
+    PyObject *class_obj = PyObject_CallFunctionObjArgs(type_obj, name, bases, namespace, NULL);
+    if (!class_obj && PyDict_GetItemString(kwargs, "metaclass")) {
+        /*
+         * A metaclass needs the full three-argument class construction path
+         * with keywords.  Rebuild the call using type(*args, **kwargs).
+         */
+        PyErr_Clear();
+        PyObject *args = PyTuple_Pack(3, name, bases, namespace);
+        if (!args) { Py_DECREF(kwargs); Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
+        class_obj = PyObject_Call(type_obj, args, kwargs);
+        Py_DECREF(args);
+    }
+    Py_DECREF(kwargs);
+    Py_DECREF(bases);
+    Py_DECREF(namespace);
+    if (!class_obj) return NULL;
+
+    for (Py_ssize_t i = 0; i < nd; ++i) {
+        PyObject *decorator = px_eval(n->children[nb + nk + i], g, s);
+        if (!decorator) { Py_DECREF(class_obj); return NULL; }
+        PyObject *next = PyObject_CallOneArg(decorator, class_obj);
+        Py_DECREF(decorator);
+        Py_DECREF(class_obj);
+        if (!next) return NULL;
+        class_obj = next;
+    }
+    return class_obj;
+}
+
 static PyObject *px_function_call(PyObject *self, PyObject *args, PyObject *kwargs)
 {
     PyXFunctionObject *fn = (PyXFunctionObject *)self;
@@ -317,6 +412,7 @@ static PyTypeObject PyXFunction_Type = {
     .tp_basicsize = sizeof(PyXFunctionObject),
     .tp_dealloc = (destructor)px_function_dealloc,
     .tp_call = px_function_call,
+    .tp_descr_get = px_function_descr_get,
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_members = px_function_members,
     .tp_doc = "PythonX native function",
@@ -1113,6 +1209,14 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         Py_DECREF(iterator);
         PyErr_SetNone(PyExc_StopIteration);
         return NULL;
+    }
+    case PYX_IR_CLASS: {
+        PyObject *klass = px_class(n, g, s);
+        if (!klass) return NULL;
+        PyObject *name = PyTuple_GET_ITEM(n->constant, 0);
+        int rc = PyDict_SetItem(g, name, klass);
+        if (rc < 0) { Py_DECREF(klass); return NULL; }
+        return klass;
     }
     case PYX_IR_FUNCTION: {
         PyObject *fn = px_function(n, g, s);
