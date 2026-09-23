@@ -410,14 +410,41 @@ static PyXIRNode *lower_expr(expr_ty e)
 
 static PyXIRNode *lower_function(stmt_ty s)
 {
+    int is_async = s->kind == AsyncFunctionDef_kind;
+    arguments_ty a = is_async ? s->v.AsyncFunctionDef.args : s->v.FunctionDef.args;
+    asdl_stmt_seq *body = is_async ? s->v.AsyncFunctionDef.body : s->v.FunctionDef.body;
+    asdl_expr_seq *decorators = is_async ? s->v.AsyncFunctionDef.decorator_list : s->v.FunctionDef.decorator_list;
+    expr_ty returns = is_async ? s->v.AsyncFunctionDef.returns : s->v.FunctionDef.returns;
+    const char *name_text = is_async ? s->v.AsyncFunctionDef.name : s->v.FunctionDef.name;
+
     PyXIRNode *n = ir_new(PYX_IR_FUNCTION);
     if (!n) return NULL;
 
-    arguments_ty a = s->v.FunctionDef.args;
-    Py_ssize_t np = asdl_seq_LEN(a->posonlyargs) + asdl_seq_LEN(a->args);
+    Py_ssize_t posonly = asdl_seq_LEN(a->posonlyargs);
+    Py_ssize_t normal = asdl_seq_LEN(a->args);
+    Py_ssize_t np = posonly + normal;
     Py_ssize_t nk = asdl_seq_LEN(a->kwonlyargs);
     Py_ssize_t nd = asdl_seq_LEN(a->defaults);
-    PyObject *meta = PyTuple_New(7);
+    Py_ssize_t ann_count = np + nk + (returns ? 1 : 0);
+    Py_ssize_t dec_count = asdl_seq_LEN(decorators);
+
+    /*
+     * meta:
+     * 0 posonly count
+     * 1 positional count
+     * 2 keyword-only count
+     * 3 *args name
+     * 4 **kwargs name
+     * 5 parameter names
+     * 6 name
+     * 7 qualname
+     * 8 module (None => globals['__name__'])
+     * 9 docstring (None if absent)
+     * 10 async flag
+     * 11 annotation count
+     * 12 decorator count
+     */
+    PyObject *meta = PyTuple_New(13);
     PyObject *names = PyTuple_New(np + nk);
     if (!meta || !names) {
         Py_XDECREF(meta);
@@ -426,33 +453,59 @@ static PyXIRNode *lower_function(stmt_ty s)
         return NULL;
     }
 
-    PyTuple_SET_ITEM(meta, 0, PyLong_FromSsize_t(asdl_seq_LEN(a->posonlyargs)));
-    PyTuple_SET_ITEM(meta, 1, PyLong_FromSsize_t(asdl_seq_LEN(a->args)));
+    PyTuple_SET_ITEM(meta, 0, PyLong_FromSsize_t(posonly));
+    PyTuple_SET_ITEM(meta, 1, PyLong_FromSsize_t(normal));
     PyTuple_SET_ITEM(meta, 2, PyLong_FromSsize_t(nk));
     PyTuple_SET_ITEM(meta, 3, a->vararg ? PyUnicode_FromString(a->vararg->arg) : Py_NewRef(Py_None));
     PyTuple_SET_ITEM(meta, 4, a->kwarg ? PyUnicode_FromString(a->kwarg->arg) : Py_NewRef(Py_None));
     PyTuple_SET_ITEM(meta, 5, names);
-    PyTuple_SET_ITEM(meta, 6, PyUnicode_FromString(s->v.FunctionDef.name));
+    PyTuple_SET_ITEM(meta, 6, PyUnicode_FromString(name_text));
+    PyTuple_SET_ITEM(meta, 7, PyUnicode_FromString(name_text));
+    PyTuple_SET_ITEM(meta, 8, Py_NewRef(Py_None));
+    PyTuple_SET_ITEM(meta, 9, Py_NewRef(Py_None));
+    PyTuple_SET_ITEM(meta, 10, PyBool_FromLong(is_async));
+    PyTuple_SET_ITEM(meta, 11, PyLong_FromSsize_t(ann_count));
+    PyTuple_SET_ITEM(meta, 12, PyLong_FromSsize_t(dec_count));
 
     Py_ssize_t j = 0;
-    for (Py_ssize_t i = 0; i < asdl_seq_LEN(a->posonlyargs); ++i)
+    for (Py_ssize_t i = 0; i < posonly; ++i)
         PyTuple_SET_ITEM(names, j++, PyUnicode_FromString(((arg_ty)asdl_seq_GET(a->posonlyargs, i))->arg));
-    for (Py_ssize_t i = 0; i < asdl_seq_LEN(a->args); ++i)
+    for (Py_ssize_t i = 0; i < normal; ++i)
         PyTuple_SET_ITEM(names, j++, PyUnicode_FromString(((arg_ty)asdl_seq_GET(a->args, i))->arg));
     for (Py_ssize_t i = 0; i < nk; ++i)
         PyTuple_SET_ITEM(names, j++, PyUnicode_FromString(((arg_ty)asdl_seq_GET(a->kwonlyargs, i))->arg));
 
+    /* Preserve the function docstring as real function metadata. */
+    if (asdl_seq_LEN(body) > 0) {
+        stmt_ty first = (stmt_ty)asdl_seq_GET(body, 0);
+        if (first->kind == Expr_kind &&
+            first->v.Expr.value->kind == Constant_kind &&
+            PyUnicode_Check(first->v.Expr.value->v.Constant.value)) {
+            PyObject *doc = first->v.Expr.value->v.Constant.value;
+            Py_INCREF(doc);
+            Py_DECREF(PyTuple_GET_ITEM(meta, 9));
+            PyTuple_SET_ITEM(meta, 9, doc);
+        }
+    }
+
     n->constant = meta;
-    n->left = lower_suite(s->v.FunctionDef.body);
+    n->left = lower_suite(body);
     if (!n->left) {
         ir_free_node(n);
         return NULL;
     }
 
-    if (set_children(n, nd + nk) < 0) {
+    /*
+     * Children are grouped as:
+     * positional defaults, keyword-only defaults, annotations, decorators.
+     * Missing kw-only/annotation entries remain NULL so runtime can distinguish
+     * "no default/annotation" from an actual None expression.
+     */
+    if (set_children(n, nd + nk + ann_count + dec_count) < 0) {
         ir_free_node(n);
         return NULL;
     }
+
     for (Py_ssize_t i = 0; i < nd; ++i) {
         n->children[i] = lower_expr((expr_ty)asdl_seq_GET(a->defaults, i));
         if (!n->children[i]) {
@@ -460,6 +513,7 @@ static PyXIRNode *lower_function(stmt_ty s)
             return NULL;
         }
     }
+
     for (Py_ssize_t i = 0; i < nk; ++i) {
         expr_ty d = (expr_ty)asdl_seq_GET(a->kw_defaults, i);
         n->children[nd + i] = d ? lower_expr(d) : NULL;
@@ -468,6 +522,40 @@ static PyXIRNode *lower_function(stmt_ty s)
             return NULL;
         }
     }
+
+    Py_ssize_t ann_base = nd + nk;
+    for (Py_ssize_t i = 0; i < posonly; ++i) {
+        arg_ty arg = (arg_ty)asdl_seq_GET(a->posonlyargs, i);
+        if (arg->annotation) {
+            n->children[ann_base + i] = lower_expr(arg->annotation);
+            if (!n->children[ann_base + i]) { ir_free_node(n); return NULL; }
+        }
+    }
+    for (Py_ssize_t i = 0; i < normal; ++i) {
+        arg_ty arg = (arg_ty)asdl_seq_GET(a->args, i);
+        if (arg->annotation) {
+            n->children[ann_base + posonly + i] = lower_expr(arg->annotation);
+            if (!n->children[ann_base + posonly + i]) { ir_free_node(n); return NULL; }
+        }
+    }
+    for (Py_ssize_t i = 0; i < nk; ++i) {
+        arg_ty arg = (arg_ty)asdl_seq_GET(a->kwonlyargs, i);
+        if (arg->annotation) {
+            n->children[ann_base + np + i] = lower_expr(arg->annotation);
+            if (!n->children[ann_base + np + i]) { ir_free_node(n); return NULL; }
+        }
+    }
+    if (returns) {
+        n->children[ann_base + np + nk] = lower_expr(returns);
+        if (!n->children[ann_base + np + nk]) { ir_free_node(n); return NULL; }
+    }
+
+    Py_ssize_t dec_base = ann_base + ann_count;
+    for (Py_ssize_t i = 0; i < dec_count; ++i) {
+        n->children[dec_base + i] = lower_expr((expr_ty)asdl_seq_GET(decorators, i));
+        if (!n->children[dec_base + i]) { ir_free_node(n); return NULL; }
+    }
+
     return n;
 }
 
@@ -477,6 +565,7 @@ static PyXIRNode *lower_stmt(stmt_ty s)
     switch(s->kind){
     case Expr_kind:return lower_expr(s->v.Expr.value);
     case FunctionDef_kind:return lower_function(s);
+    case AsyncFunctionDef_kind:return lower_function(s);
     case If_kind:return lower_if(s);
     case While_kind:return lower_while(s);
     case For_kind:return lower_for(s,0);
