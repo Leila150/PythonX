@@ -39,7 +39,17 @@ PyTypeObject PyXObject_Type = {
     .tp_name = "pythonx.object",
     .tp_basicsize = sizeof(PyXObject),
     .tp_dealloc = (destructor)pythonx_object_dealloc,
+    /*
+     * Keep print(obj) fully native for PythonX objects.  CPython's normal
+     * object string fallback is equivalent to repr(), but providing the slot
+     * explicitly makes the PythonX root object own that behavior and ensures
+     * print() has a direct string representation.
+     *
+     * A user-defined __str__ on a PythonX class still overrides this slot
+     * through the normal type machinery and the PythonX dunder bridge.
+     */
     .tp_repr = pythonx_object_repr,
+    .tp_str = pythonx_object_repr,
     .tp_as_async = NULL,
     .tp_flags = Py_TPFLAGS_DEFAULT |
                 Py_TPFLAGS_BASETYPE |
