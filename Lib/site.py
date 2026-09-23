@@ -687,6 +687,16 @@ def execusercustomize():
                 (err.__class__.__name__, err))
 
 
+def addpythonxpackages(known_paths):
+    """Add packages installed by PythonX pipx to the PythonX environment."""
+    root = os.environ.get("PYTHONX_HOME")
+    if root:
+        package_dir = os.path.join(os.path.expanduser(root), "site-packages")
+    else:
+        package_dir = os.path.join(os.path.expanduser("~"), ".pythonx", "site-packages")
+    return addsitedir(package_dir, known_paths)
+
+
 def main():
     """Add standard site-specific directories to the module search path.
 
@@ -707,6 +717,7 @@ def main():
         ENABLE_USER_SITE = check_enableusersite()
     known_paths = addusersitepackages(known_paths)
     known_paths = addsitepackages(known_paths)
+    known_paths = addpythonxpackages(known_paths)
     setquit()
     setcopyright()
     sethelper()
