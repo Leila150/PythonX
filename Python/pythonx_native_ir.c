@@ -2133,6 +2133,35 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         expr->left->op == PYX_IR_CONST && expr->right->op == PYX_IR_CONST &&
         px_native_int64(expr->left->constant, &a) &&
         px_native_int64(expr->right->constant, &b)) {
+        /*
+         * Python integers are arbitrary precision.  Only specialize when
+         * the exact Python result fits in int64_t; otherwise fall back to
+         * the normal evaluator instead of silently wrapping.
+         */
+        PyObject *va = PyLong_FromLongLong(a);
+        PyObject *vb = PyLong_FromLongLong(b);
+        PyObject *vres = NULL;
+        long long result;
+        if (!va || !vb) {
+            Py_XDECREF(va);
+            Py_XDECREF(vb);
+            return NULL;
+        }
+        if (expr->op == PYX_IR_ADD)
+            vres = PyNumber_Add(va, vb);
+        else if (expr->op == PYX_IR_SUB)
+            vres = PyNumber_Subtract(va, vb);
+        else
+            vres = PyNumber_Multiply(va, vb);
+        Py_DECREF(va);
+        Py_DECREF(vb);
+        if (!vres)
+            return NULL;
+        if (!px_native_int64(vres, &result)) {
+            Py_DECREF(vres);
+            return NULL;
+        }
+        Py_DECREF(vres);
 
 #if defined(_WIN32)
         /* Windows x64: RCX is the first argument to PyLong_FromLongLong. */
@@ -2141,13 +2170,11 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         code[p++]=0x49; code[p++]=0xB8;
         memcpy(code+p,&b,8); p+=8;
         if (expr->op == PYX_IR_ADD) {
-            code[p++]=0x49; code[p++]=0x01; code[p++]=0xC0; /* add r8, rax */
-            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0; /* mov rax, r8 */
+            code[p++]=0x4C; code[p++]=0x01; code[p++]=0xC0; /* add rax, r8 */
         } else if (expr->op == PYX_IR_SUB) {
-            code[p++]=0x49; code[p++]=0x29; code[p++]=0xC0; /* sub r8, rax */
-            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0;
+            code[p++]=0x4C; code[p++]=0x29; code[p++]=0xC0; /* sub rax, r8 */
         } else {
-            code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax,r8 */
+            code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax, r8 */
         }
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC1; /* mov rcx, rax */
 #else
@@ -2157,13 +2184,11 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         code[p++]=0x49; code[p++]=0xB8;
         memcpy(code+p,&b,8); p+=8;
         if (expr->op == PYX_IR_ADD) {
-            code[p++]=0x4C; code[p++]=0x01; code[p++]=0xC0; /* add r8, rax */
-            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0;
+            code[p++]=0x4C; code[p++]=0x01; code[p++]=0xC0; /* add rax, r8 */
         } else if (expr->op == PYX_IR_SUB) {
-            code[p++]=0x4C; code[p++]=0x29; code[p++]=0xC0; /* sub r8, rax */
-            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0;
+            code[p++]=0x4C; code[p++]=0x29; code[p++]=0xC0; /* sub rax, r8 */
         } else {
-            code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax,r8 */
+            code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax, r8 */
         }
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7; /* mov rdi, rax */
 #endif
