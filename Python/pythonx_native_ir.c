@@ -2282,62 +2282,53 @@ emit_divmod:
             if (!vres)
                 return NULL;
 
-            /* True division is not representable by the integer emitter. */
+            /* True division returns float, so keep it on the evaluator path. */
             if (expr->op == PYX_IR_TRUEDIV) {
                 Py_DECREF(vres);
                 goto emit_value;
             }
 
             /*
-             * Python // and % differ from x86 truncating division for
-             * negative operands. Only specialize cases where the exact
-             * Python result matches the native truncating result.
+             * x86 IDIV truncates toward zero, while Python // floors.
+             * Only emit native // when it is exactly the truncating quotient.
+             * For %, the x86 remainder has the dividend's sign, matching
+             * Python only when the divisor divides evenly or both operands
+             * have compatible signs.
              */
-            if (!PyLong_Check(vres)) {
-                Py_DECREF(vres);
-                goto emit_value;
-            }
-
             {
                 int overflow = 0;
-                long long q = PyLong_AsLongLongAndOverflow(vres, &overflow);
+                long long result = PyLong_AsLongLongAndOverflow(vres, &overflow);
+                int native_ok = !overflow && !PyErr_Occurred();
                 Py_DECREF(vres);
-                if (overflow || PyErr_Occurred())
+                if (!native_ok)
                     goto emit_value;
 
-                PyObject *va2 = PyLong_FromLongLong(a);
-                PyObject *vb2 = PyLong_FromLongLong(b);
-                PyObject *vnative = NULL;
-                if (!va2 || !vb2) {
-                    Py_XDECREF(va2);
-                    Py_XDECREF(vb2);
-                    return NULL;
-                }
-                if (expr->op == PYX_IR_FLOORDIV)
-                    vnative = PyNumber_FloorDivide(va2, vb2);
-                else
-                    vnative = PyNumber_Remainder(va2, vb2);
-                Py_XDECREF(vnative);
-                Py_DECREF(va2);
-                Py_DECREF(vb2);
+                if (b == 0)
+                    goto emit_value;
 
-#if defined(_WIN32)
+                if (expr->op == PYX_IR_FLOORDIV) {
+                    long long trunc_q = a / b;
+                    long long trunc_r = a % b;
+                    if (trunc_r != 0 && ((a < 0) != (b < 0)))
+                        trunc_q -= 1;
+                    if (trunc_q != result)
+                        goto emit_value;
+                } else {
+                    long long native_r = a % b;
+                    if (native_r != result)
+                        goto emit_value;
+                }
+
                 code[p++]=0x48; code[p++]=0xB8;
                 memcpy(code+p,&a,8); p+=8;
                 code[p++]=0x49; code[p++]=0xB8;
                 memcpy(code+p,&b,8); p+=8;
                 code[p++]=0x48; code[p++]=0x99;
                 code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8;
-#else
-                code[p++]=0x48; code[p++]=0xB8;
-                memcpy(code+p,&a,8); p+=8;
-                code[p++]=0x49; code[p++]=0xB8;
-                memcpy(code+p,&b,8); p+=8;
-                code[p++]=0x48; code[p++]=0x99;
-                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8;
-#endif
                 if (expr->op == PYX_IR_MOD) {
                     code[p++]=0x48; code[p++]=0x89; code[p++]=0xD0;
+                } else {
+                    code[p++]=0x48; code[p++]=0x89; code[p++]=0xC0;
                 }
                 goto emit_long_call_with_value;
             }
@@ -2384,6 +2375,7 @@ emit_value:
     code[p++]=0x48; code[p++]=0xBF;
 #endif
     memcpy(code+p,&a,8); p+=8;
+    goto emit_call;
 
 emit_bool_call:
 #if defined(_WIN32)
