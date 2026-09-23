@@ -2515,6 +2515,7 @@ bininstall: commoninstall altbininstall
 	fi
 	-rm -f $(DESTDIR)$(BINDIR)/python3-config
 	(cd $(DESTDIR)$(BINDIR); $(LN) -s python$(VERSION)-config python3-config)
+	$(INSTALL_SCRIPT) $(srcdir)/Tools/pipx/pipx.py $(DESTDIR)$(BINDIR)/pipx
 	-rm -f $(DESTDIR)$(LIBPC)/python3.pc
 	(cd $(DESTDIR)$(LIBPC); $(LN) -s python-$(VERSION).pc python3.pc)
 	-rm -f $(DESTDIR)$(LIBPC)/python3-embed.pc
