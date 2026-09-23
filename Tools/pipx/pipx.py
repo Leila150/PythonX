@@ -469,6 +469,7 @@ def resolve_dependencies(
         for key in list(requirements):
             name = names[key]
             data, source_index = package_data(name, indexes_list)
+            data["_source_index"] = source_index
             project = data.get("info", {})
             canonical = project.get("name", name)
             constraints = requirements[key]
@@ -543,11 +544,13 @@ def install_package(
     for key, (data, distribution, _) in resolved.items():
         project = data.get("info", {})
         canonical = project.get("name", namesafe := key)
-        if os_build and distribution["packagetype"] == "bdist_wheel":
-            with tempfile.TemporaryDirectory(prefix="pythonx-pipx-os-") as tmp:
-                archive = Path(tmp) / distribution["filename"]
-                download(distribution["url"], archive)
-                check_os_compatibility(data, distribution["filename"], read_wheel_metadata(archive))
+        if os_build:
+            check_os_compatibility(data, distribution["filename"])
+            if distribution["packagetype"] == "bdist_wheel":
+                with tempfile.TemporaryDirectory(prefix="pythonx-pipx-os-") as tmp:
+                    archive = Path(tmp) / distribution["filename"]
+                    download(distribution["url"], archive)
+                    check_os_compatibility(data, distribution["filename"], read_wheel_metadata(archive))
         print(f"pipx: resolved {canonical} {distribution.get('version', '')}")
 
     for key, (data, distribution, _) in resolved.items():
