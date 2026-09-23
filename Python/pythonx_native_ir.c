@@ -1677,6 +1677,72 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
     case PYX_IR_ASYNC_WITH:return px_with(n,g,s,1);
     case PYX_IR_RAISE:{PyObject*e=px_eval(n->children[0],g,s),*c=n->child_count>1?px_eval(n->children[1],g,s):NULL;if(!e){Py_XDECREF(c);return NULL;}int rc=_PyX_StatementRaise(e,c);Py_DECREF(e);Py_XDECREF(c);return rc<0?NULL:Py_NewRef(Py_None);}
     case PYX_IR_RERAISE:return _PyX_StatementReraise()<0?NULL:Py_NewRef(Py_None);
+    case PYX_IR_IMPORT: {
+        PyObject *items = n->constant;
+        Py_ssize_t count = PyTuple_GET_SIZE(items);
+        for (Py_ssize_t i = 0; i < count; ++i) {
+            PyObject *item = PyTuple_GET_ITEM(items, i);
+            PyObject *module_name = PyTuple_GET_ITEM(item, 0);
+            PyObject *asname = PyTuple_GET_ITEM(item, 1);
+            PyObject *module = PyImport_Import(module_name);
+            if (!module) return NULL;
+            PyObject *bind = asname != Py_None ? asname : module_name;
+            PyObject *dot = PyUnicode_FindChar(bind, '.', 0, PyUnicode_GET_LENGTH(bind), 1);
+            PyObject *name = NULL;
+            if (asname == Py_None && dot != Py_None) {
+                name = PyUnicode_Substring(bind, 0, PyUnicode_GET_LENGTH(bind));
+            }
+            if (asname == Py_None) {
+                Py_ssize_t pos = PyUnicode_FindChar(bind, '.', 0, PyUnicode_GET_LENGTH(bind), 1);
+                if (pos >= 0) {
+                    Py_DECREF(module);
+                    module = PyImport_Import(PyUnicode_Substring(bind, 0, pos));
+                    if (!module) return NULL;
+                    bind = PyTuple_GET_ITEM(item, 0);
+                    Py_INCREF(module);
+                    Py_DECREF(module);
+                    module = PyImport_Import(PyUnicode_Substring(bind, 0, pos));
+                    if (!module) return NULL;
+                }
+            }
+            int rc = PyDict_SetItem(g, bind, module);
+            Py_XDECREF(name);
+            Py_DECREF(module);
+            if (rc < 0) return NULL;
+        }
+        return Py_NewRef(Py_None);
+    }
+    case PYX_IR_IMPORT_FROM: {
+        PyObject *meta = n->constant;
+        PyObject *module_name = PyTuple_GET_ITEM(meta, 0);
+        long level = PyLong_AsLong(PyTuple_GET_ITEM(meta, 1));
+        if (level == -1 && PyErr_Occurred()) return NULL;
+        PyObject *module = module_name == Py_None ? PyUnicode_FromString("") : Py_NewRef(module_name);
+        if (!module) return NULL;
+        PyObject *pkg = PyImport_Import(module);
+        Py_DECREF(module);
+        if (!pkg) return NULL;
+        Py_ssize_t count = PyTuple_GET_SIZE(meta) - 2;
+        for (Py_ssize_t i = 0; i < count; ++i) {
+            PyObject *item = PyTuple_GET_ITEM(meta, i + 2);
+            PyObject *name = PyTuple_GET_ITEM(item, 0);
+            PyObject *asname = PyTuple_GET_ITEM(item, 1);
+            if (PyUnicode_CompareWithASCIIString(name, "*") == 0) {
+                PyObject *dict = PyModule_GetDict(pkg);
+                if (!dict) { Py_DECREF(pkg); return NULL; }
+                if (PyDict_Update(g, dict) < 0) { Py_DECREF(pkg); return NULL; }
+                continue;
+            }
+            PyObject *value = PyObject_GetAttr(pkg, name);
+            if (!value) { Py_DECREF(pkg); return NULL; }
+            PyObject *bind = asname != Py_None ? asname : name;
+            int rc = PyDict_SetItem(g, bind, value);
+            Py_DECREF(value);
+            if (rc < 0) { Py_DECREF(pkg); return NULL; }
+        }
+        Py_DECREF(pkg);
+        return Py_NewRef(Py_None);
+    }
     case PYX_IR_ASSERT:{PyObject*t=px_eval(n->children[0],g,s),*m=px_eval(n->children[1],g,s);if(!t||!m){Py_XDECREF(t);Py_XDECREF(m);return NULL;}int rc=_PyX_StatementAssert(t,m);Py_DECREF(t);Py_DECREF(m);return rc<0?NULL:Py_NewRef(Py_None);}
     case PYX_IR_NOT:case PYX_IR_INVERT:case PYX_IR_POSITIVE:case PYX_IR_NEGATIVE:{PyObject*v=px_eval(n->left,g,s);if(!v)return NULL;PyObject*r;if(n->op==PYX_IR_NOT){int t=PyObject_IsTrue(v);r=t<0?NULL:PyBool_FromLong(!t);}else if(n->op==PYX_IR_INVERT)r=PyNumber_Invert(v);else if(n->op==PYX_IR_POSITIVE)r=PyNumber_Positive(v);else r=PyNumber_Negative(v);Py_DECREF(v);return r;}
     case PYX_IR_SLICE:{PyObject*a=px_eval(n->children[0],g,s),*b=px_eval(n->children[1],g,s),*c=px_eval(n->children[2],g,s);if(!a||!b||!c){Py_XDECREF(a);Py_XDECREF(b);Py_XDECREF(c);return NULL;}PyObject*r=PySlice_New(a,b,c);Py_DECREF(a);Py_DECREF(b);Py_DECREF(c);return r;}
