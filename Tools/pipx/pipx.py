@@ -563,21 +563,27 @@ def show_package(name: str) -> None:
 
 def files_package(name: str) -> None:
     meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    if not target.exists():
-        raise RuntimeError(f"PythonX pipx: package files are missing for {name!r}.")
-    for path in sorted(target.rglob("*")):
+    target = packages_dir()
+    files = meta.get("installed_files", [])
+    if not files:
+        raise RuntimeError(f"PythonX pipx: no installed-file manifest exists for {name!r}.")
+    for relative in sorted(files):
+        path = target / relative
         if path.is_file():
-            print(path.relative_to(target))
+            print(relative)
 
 
 def verify_package(name: str) -> None:
     meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    if not target.exists():
-        raise RuntimeError(f"PythonX pipx: package files are missing for {name!r}.")
-    py_files = list(target.rglob("*.py"))
-    print(f"pipx: {meta['name']} {meta.get('version', '')} is installed.")
+    target = packages_dir()
+    files = meta.get("installed_files", [])
+    missing = [relative for relative in files if not (target / relative).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"PythonX pipx: {name!r} is incomplete; {len(missing)} installed files are missing."
+        )
+    py_files = [relative for relative in files if relative.endswith(".py")]
+    print(f"pipx: {meta['name']} {meta.get('version', '')} is installed in PythonX.")
     print(f"pipx: {len(py_files)} Python source files found.")
     print(f"pipx: OS build package: {'yes' if meta.get('os_build') else 'no'}")
 
