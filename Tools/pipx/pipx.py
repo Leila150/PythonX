@@ -75,6 +75,33 @@ def data_home() -> Path:
     return home()
 
 
+def config_path() -> Path:
+    return data_home() / "pipx.json"
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    if not path.exists():
+        return {"indexes": [PYPI_SIMPLE]}
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"indexes": [PYPI_SIMPLE]}
+    indexes = config.get("indexes")
+    if not isinstance(indexes, list) or not indexes:
+        indexes = [PYPI_SIMPLE]
+    return {"indexes": [str(x).rstrip("/") + "/" for x in indexes if str(x).strip()]}
+
+
+def save_config(config: dict[str, Any]) -> None:
+    data_home().mkdir(parents=True, exist_ok=True)
+    config_path().write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def configured_indexes() -> list[str]:
+    return load_config()["indexes"]
+
+
 
 
 def metadata_dir() -> Path:
@@ -536,7 +563,7 @@ def install_package(
     seen: set[str] | None = None,
     dependency_constraints: list[tuple[str, str]] | None = None,
 ) -> None:
-    indexes_list = indexes_list or [PYPI_SIMPLE]
+    indexes_list = indexes_list or configured_indexes()
     constraints = dependency_constraints or []
     resolved = resolve_dependencies(name, requested_version, os_build, indexes_list, no_deps)
 
@@ -805,6 +832,17 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("environment", aliases=["env"], help="Show the active PythonX environment.")
     sub.add_parser("clear", help="Remove all third-party packages from the environment.")
 
+    source = sub.add_parser("source", help="Manage Python package indexes.")
+    source_sub = source.add_subparsers(dest="source_command", required=True)
+    source_sub.add_parser("list", aliases=["ls"])
+    source_add = source_sub.add_parser("add")
+    source_add.add_argument("url")
+    source_remove = source_sub.add_parser("remove", aliases=["rm"])
+    source_remove.add_argument("url")
+    source_set = source_sub.add_parser("set")
+    source_set.add_argument("url")
+    source_sub.add_parser("clear")
+
     args = parser.parse_args(argv)
 
     try:
@@ -837,6 +875,31 @@ def main(argv: list[str] | None = None) -> int:
             show_environment()
         elif args.command == "clear":
             clear_packages()
+        elif args.command == "source":
+            config = load_config()
+            if args.source_command in {"list", "ls"}:
+                for index in config["indexes"]:
+                    print(index)
+            elif args.source_command == "add":
+                url = args.url.rstrip("/") + "/"
+                if url not in config["indexes"]:
+                    config["indexes"].append(url)
+                    save_config(config)
+                print(f"pipx: package source added: {url}")
+            elif args.source_command in {"remove", "rm"}:
+                url = args.url.rstrip("/") + "/"
+                if url == PYPI_SIMPLE:
+                    raise RuntimeError("pipx: the default PyPI source cannot be removed.")
+                config["indexes"] = [x for x in config["indexes"] if x != url] or [PYPI_SIMPLE]
+                save_config(config)
+                print(f"pipx: package source removed: {url}")
+            elif args.source_command == "set":
+                url = args.url.rstrip("/") + "/"
+                save_config({"indexes": [url]})
+                print(f"pipx: package sources replaced with: {url}")
+            elif args.source_command == "clear":
+                save_config({"indexes": [PYPI_SIMPLE]})
+                print("pipx: package sources reset to PyPI.")
         return 0
     except (urllib.error.HTTPError, urllib.error.URLError) as exc:
         print(f"pipx: network error: {exc}", file=sys.stderr)
