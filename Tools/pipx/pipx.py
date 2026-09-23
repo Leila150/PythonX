@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import zipfile
+from email.parser import Parser
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,12 @@ def fetch_json(url: str) -> dict[str, Any]:
     )
     with urllib.request.urlopen(req, timeout=30) as response:
         return json.load(response)
+
+
+def fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "PythonX-pipx/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.read().decode("utf-8", "replace")
 
 
 def download(url: str, destination: Path) -> None:
@@ -142,32 +149,25 @@ def wheel_score(filename: str) -> int:
 def choose_distribution(data: dict[str, Any], requested: str | None) -> dict[str, Any]:
     releases = data.get("releases", {})
     if requested:
-        files = releases.get(requested, [])
-        if not files:
-            raise RuntimeError(f"PythonX pipx: version {requested!r} was not found.")
+        candidates = [(requested, releases.get(requested, []))]
     else:
-        versions = [v for v, files in releases.items() if files]
-        if not versions:
-            raise RuntimeError("PythonX pipx: PyPI has no downloadable releases.")
-        requested = max(versions, key=version_key)
-        files = releases[requested]
-
-    wheels = [f for f in files if f.get("packagetype") == "bdist_wheel"]
-    scored = sorted(
-        ((wheel_score(f["filename"]), f) for f in wheels),
-        key=lambda item: item[0],
-        reverse=True,
-    )
-    if scored and scored[0][0] >= 0:
-        return scored[0][1]
-
-    sdists = [f for f in files if f.get("packagetype") == "sdist"]
-    if sdists:
-        return sdists[0]
-
-    raise RuntimeError(
-        f"PythonX pipx: no compatible wheel or source distribution was found for {data.get('info', {}).get('name', requested)}."
-    )
+        candidates = sorted(
+            ((v, f) for v, f in releases.items() if f),
+            key=lambda x: version_key(x[0]),
+            reverse=True,
+        )
+    for version, files in candidates:
+        wheels = [f for f in files if f.get("packagetype") == "bdist_wheel"]
+        scored = sorted(
+            ((wheel_score(f.get("filename", "")), f) for f in wheels),
+            key=lambda x: x[0], reverse=True,
+        )
+        if scored and scored[0][0] >= 0:
+            return scored[0][1]
+        sdists = [f for f in files if f.get("packagetype") == "sdist"]
+        if sdists:
+            return sdists[0]
+    raise RuntimeError(f"PythonX pipx: no compatible distribution found for {data.get('info', {}).get('name', requested)}.")
 
 
 def verify_hash(path: Path, expected: str | None) -> None:
@@ -199,18 +199,18 @@ def extract_archive(archive: Path, destination: Path) -> Path:
     return destination
 
 
-def read_wheel_metadata(archive: Path) -> dict[str, str]:
-    result: dict[str, str] = {}
+def read_wheel_metadata(archive: Path) -> dict[str, Any]:
+    result: dict[str, Any] = {"Requires-Dist": []}
     with zipfile.ZipFile(archive) as z:
-        metadata_files = [n for n in z.namelist() if n.endswith(".dist-info/METADATA")]
-        if not metadata_files:
+        names = [n for n in z.namelist() if n.endswith(".dist-info/METADATA")]
+        if not names:
             return result
-        text = z.read(metadata_files[0]).decode("utf-8", "replace")
-    for line in text.splitlines():
-        if ": " in line:
-            key, value = line.split(": ", 1)
-            if key in {"Name", "Version", "Requires-Dist", "PythonX-OS-Unsupported"}:
-                result.setdefault(key, value)
+        message = Parser().parsestr(z.read(names[0]).decode("utf-8", "replace"))
+    for key in ("Name", "Version", "Summary", "PythonX-OS-Unsupported"):
+        value = message.get(key)
+        if value is not None:
+            result[key] = value
+    result["Requires-Dist"] = message.get_all("Requires-Dist", [])
     return result
 
 
@@ -302,10 +302,23 @@ def package_json(name: str, index_url: str | None = None) -> dict[str, Any]:
         return fetch_json(f"{PYPI}/{urllib.parse.quote(name, safe='')}/json")
     base = index_url.rstrip("/")
     if base.endswith("/simple"):
-        json_url = base[:-7] + f"/pypi/{urllib.parse.quote(name, safe='')}/json"
-    else:
-        json_url = base + f"/pypi/{urllib.parse.quote(name, safe='')}/json"
-    return fetch_json(json_url)
+        base = base[:-7]
+    return fetch_json(base + f"/pypi/{urllib.parse.quote(name, safe='')}/json")
+
+
+def simple_project_files(name: str, index_url: str) -> list[dict[str, Any]]:
+    url = index_url.rstrip("/") + "/" + urllib.parse.quote(normalize(name), safe="") + "/"
+    html = fetch_text(url)
+    links = re.findall('<a[^>]+href=["\\\']([^"\\\']+)["\\\']', html, re.I)
+    files = []
+    for href in links:
+        file_url = urllib.parse.urljoin(url, href)
+        filename = urllib.parse.unquote(file_url.split("#", 1)[0].rsplit("/", 1)[-1])
+        if filename.endswith(".whl"):
+            files.append({"filename": filename, "url": file_url, "packagetype": "bdist_wheel", "digests": {}})
+        elif filename.endswith((".tar.gz", ".zip")):
+            files.append({"filename": filename, "url": file_url, "packagetype": "sdist", "digests": {}})
+    return files
 
 
 def package_data(name: str, indexes_list: list[str]) -> tuple[dict[str, Any], str]:
@@ -314,11 +327,17 @@ def package_data(name: str, indexes_list: list[str]) -> tuple[dict[str, Any], st
         try:
             return package_json(name, index), index
         except Exception as exc:
-            errors.append(f"{index}: {exc}")
-    raise RuntimeError(
-        f"PythonX pipx: package {name!r} was not found in configured indexes. "
-        + " | ".join(errors)
-    )
+            try:
+                files = simple_project_files(name, index)
+                if files:
+                    return {"info": {"name": name}, "releases": {"0": files}}, index
+            except Exception as simple_exc:
+                errors.append(f"{index}: {exc}; simple: {simple_exc}")
+            else:
+                errors.append(f"{index}: {exc}")
+    raise RuntimeError(f"PythonX pipx: package {name!r} was not found in configured indexes. " + " | ".join(errors))
+
+
 
 
 def requirement_parts(requirement: str) -> tuple[str, list[tuple[str, str]]]:
