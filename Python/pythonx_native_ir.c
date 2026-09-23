@@ -2096,44 +2096,96 @@ static void free_exec(void*p,size_t size){
 #endif
 }
 static void capsule_free(PyObject*c){XIRNativeCode*n=PyCapsule_GetPointer(c,"PythonX.native_ir_code");if(!n){PyErr_Clear();return;}free_exec(n->code,n->size);PyXIRFunction f={n->root,n->globals};_PyX_IR_Free(&f);PyMem_RawFree(n);}
-static PyObject *px_native_const_x86(const PyXIRFunction *f)
+static int px_native_int64(const PyObject *obj, long long *out)
+{
+    int overflow = 0;
+    if (!PyLong_CheckExact(obj))
+        return 0;
+    *out = PyLong_AsLongLongAndOverflow((PyObject *)obj, &overflow);
+    if (overflow || (*out == -1 && PyErr_Occurred())) {
+        PyErr_Clear();
+        return 0;
+    }
+    return 1;
+}
+
+static PyObject *px_native_int_x86(const PyXIRFunction *f)
 {
     const PyXIRNode *root = f->root;
-    if (!root || root->op != PYX_IR_SEQUENCE || root->child_count != 1 ||
-        !root->children || !root->children[0] ||
-        root->children[0]->op != PYX_IR_CONST)
-        return NULL;
-
-    PyObject *constant = root->children[0]->constant;
-    if (!PyLong_CheckExact(constant))
-        return NULL;
-
-    int overflow = 0;
-    long long value = PyLong_AsLongLongAndOverflow(constant, &overflow);
-    if (overflow || (value == -1 && PyErr_Occurred())) {
-        PyErr_Clear();
-        return NULL;
-    }
-
-    unsigned char code[64];
+    const PyXIRNode *expr = NULL;
+    long long a, b;
+    unsigned char code[96];
     size_t p = 0;
 
+    if (!root || root->op != PYX_IR_SEQUENCE || root->child_count != 1 ||
+        !root->children || !(expr = root->children[0]))
+        return NULL;
+
+    if (expr->op == PYX_IR_CONST) {
+        if (!px_native_int64(expr->constant, &a))
+            return NULL;
+        goto emit_value;
+    }
+
+    if (expr->left && expr->right &&
+        (expr->op == PYX_IR_ADD || expr->op == PYX_IR_SUB ||
+         expr->op == PYX_IR_MUL) &&
+        expr->left->op == PYX_IR_CONST && expr->right->op == PYX_IR_CONST &&
+        px_native_int64(expr->left->constant, &a) &&
+        px_native_int64(expr->right->constant, &b)) {
+
 #if defined(_WIN32)
-    code[p++]=0x48; code[p++]=0x83; code[p++]=0xEC; code[p++]=0x28;
+        /* Windows x64: RCX is the first argument to PyLong_FromLongLong. */
+        code[p++]=0x48; code[p++]=0xB8;
+        memcpy(code+p,&a,8); p+=8;
+        code[p++]=0x49; code[p++]=0xB8;
+        memcpy(code+p,&b,8); p+=8;
+        if (expr->op == PYX_IR_ADD) {
+            code[p++]=0x49; code[p++]=0x01; code[p++]=0xC0; /* add r8, rax */
+            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0; /* mov rax, r8 */
+        } else if (expr->op == PYX_IR_SUB) {
+            code[p++]=0x49; code[p++]=0x29; code[p++]=0xC0; /* sub r8, rax */
+            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0;
+        } else {
+            code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax,r8 */
+        }
+        code[p++]=0x48; code[p++]=0x89; code[p++]=0xC1; /* mov rcx, rax */
+#else
+        /* System V AMD64: RDI is the first argument to PyLong_FromLongLong. */
+        code[p++]=0x48; code[p++]=0xB8;
+        memcpy(code+p,&a,8); p+=8;
+        code[p++]=0x49; code[p++]=0xB8;
+        memcpy(code+p,&b,8); p+=8;
+        if (expr->op == PYX_IR_ADD) {
+            code[p++]=0x4C; code[p++]=0x01; code[p++]=0xC0; /* add r8, rax */
+            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0;
+        } else if (expr->op == PYX_IR_SUB) {
+            code[p++]=0x4C; code[p++]=0x29; code[p++]=0xC0; /* sub r8, rax */
+            code[p++]=0x4C; code[p++]=0x89; code[p++]=0xC0;
+        } else {
+            code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax,r8 */
+        }
+        code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7; /* mov rdi, rax */
+#endif
+        goto emit_call;
+    }
+    return NULL;
+
+emit_value:
+#if defined(_WIN32)
     code[p++]=0x48; code[p++]=0xB9;
 #else
     code[p++]=0x48; code[p++]=0xBF;
 #endif
-    memcpy(code+p, &value, sizeof(value)); p += sizeof(value);
+    memcpy(code+p,&a,8); p+=8;
+
+emit_call:
     code[p++]=0x48; code[p++]=0xB8;
     {
         uint64_t fn=(uint64_t)(uintptr_t)&PyLong_FromLongLong;
-        memcpy(code+p,&fn,sizeof(fn)); p+=sizeof(fn);
+        memcpy(code+p,&fn,8); p+=8;
     }
     code[p++]=0xFF; code[p++]=0xD0;
-#if defined(_WIN32)
-    code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x28;
-#endif
     code[p++]=0xC3;
 
     void *m=alloc_exec(p);
@@ -2168,7 +2220,7 @@ static PyObject *px_native_const_x86(const PyXIRFunction *f)
 PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
 {
     if(!f||!f->root){PyErr_SetString(PyExc_TypeError,"PythonX native IR compiler requires a function");return NULL;}
-    PyObject *constant_native = px_native_const_x86(f);
+    PyObject *constant_native = px_native_int_x86(f);
     if (constant_native)
         return constant_native;
     if (PyErr_Occurred())
