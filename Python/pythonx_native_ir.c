@@ -72,6 +72,7 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
     PyObject *capsule = PyCFunction_GET_SELF(self);
     PXLambdaClosure *c = PyCapsule_GetPointer(capsule, "PythonX.lambda");
     if (!c) return NULL;
+
     const PyXIRNode *n = c->node;
     PyObject *meta = n->constant;
     Py_ssize_t posonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 0));
@@ -80,101 +81,154 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
     PyObject *vararg_name = PyTuple_GET_ITEM(meta, 3);
     PyObject *kwarg_name = PyTuple_GET_ITEM(meta, 4);
     PyObject *names = PyTuple_GET_ITEM(meta, 5);
-    PyObject *callable_name = PyTuple_GET_SIZE(meta) > 6 ? PyTuple_GET_ITEM(meta, 6) : PyUnicode_FromString("<lambda>");
+    PyObject *callable_name = PyTuple_GET_SIZE(meta) > 6
+        ? PyTuple_GET_ITEM(meta, 6) : PyUnicode_FromString("<lambda>");
     int owns_callable_name = PyTuple_GET_SIZE(meta) <= 6;
-    const char *kind_name = PyUnicode_Check(callable_name) ? PyUnicode_AsUTF8(callable_name) : "<function>";
+    const char *kind_name = PyUnicode_Check(callable_name)
+        ? PyUnicode_AsUTF8(callable_name) : "<function>";
     if (!kind_name) {
         if (owns_callable_name) Py_DECREF(callable_name);
         return NULL;
     }
-    Py_ssize_t total_pos = posonly + positional;
 
-    if (posonly < 0 || positional < 0 || kwonly < 0) return NULL;
-    if (PyTuple_GET_SIZE(args) > total_pos && vararg_name == Py_None) {
-        PyErr_Format(PyExc_TypeError, "%s() takes %zd positional arguments but %zd were given",
-                     kind_name, total_pos, PyTuple_GET_SIZE(args));
-        return NULL;
+    Py_ssize_t total_pos = posonly + positional;
+    Py_ssize_t arg_count = PyTuple_GET_SIZE(args);
+    if (posonly < 0 || positional < 0 || kwonly < 0 ||
+        PyTuple_GET_SIZE(names) != total_pos + kwonly) {
+        PyErr_SetString(PyExc_SystemError, "invalid PythonX function signature");
+        goto error_no_locals;
+    }
+
+    if (arg_count > total_pos && vararg_name == Py_None) {
+        PyErr_Format(PyExc_TypeError,
+                     "%s() takes %zd positional arguments but %zd were given",
+                     kind_name, total_pos, arg_count);
+        goto error_no_locals;
     }
 
     PyObject *locals = PyDict_Copy(c->globals);
-    if (!locals) return NULL;
+    if (!locals) goto error_no_locals;
 
+    /* Positional-only and normal positional parameters. */
     for (Py_ssize_t i = 0; i < total_pos; ++i) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
         PyObject *value = NULL;
-        if (i < PyTuple_GET_SIZE(args)) {
+
+        if (i < arg_count) {
             value = PyTuple_GET_ITEM(args, i);
             if (kwargs && PyDict_GetItemWithError(kwargs, name)) {
-                PyErr_Format(PyExc_TypeError, "%s() got multiple values for argument '%U'", kind_name, name);
+                if (i < posonly) {
+                    PyErr_Format(PyExc_TypeError,
+                                 "%s() got some positional-only arguments passed as keyword arguments: '%U'",
+                                 kind_name, name);
+                } else {
+                    PyErr_Format(PyExc_TypeError,
+                                 "%s() got multiple values for argument '%U'",
+                                 kind_name, name);
+                }
                 goto error;
             }
-        } else if (kwargs) value = PyDict_GetItemWithError(kwargs, name);
-        if (!value && PyErr_Occurred()) goto error;
-        if (!value) {
-            Py_ssize_t default_index = i - (total_pos - PyTuple_GET_SIZE(c->defaults));
-            if (default_index >= 0) value = PyTuple_GET_ITEM(c->defaults, default_index);
-        }
-        if (!value) {
-            PyErr_Format(PyExc_TypeError, "%s() missing required argument: '%U'", kind_name, name);
+        } else if (i >= posonly && kwargs) {
+            value = PyDict_GetItemWithError(kwargs, name);
+            if (!value && PyErr_Occurred()) goto error;
+        } else if (i < posonly && kwargs && PyDict_GetItemWithError(kwargs, name)) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s() got some positional-only arguments passed as keyword arguments: '%U'",
+                         kind_name, name);
             goto error;
         }
-        if (i < posonly && kwargs && PyDict_GetItemWithError(kwargs, name)) {
-            PyErr_Format(PyExc_TypeError, "%s() got some positional-only arguments passed as keyword arguments: '%U'", name);
+
+        if (!value) {
+            Py_ssize_t default_count = PyTuple_GET_SIZE(c->defaults);
+            Py_ssize_t default_index = i - (total_pos - default_count);
+            if (default_index >= 0) value = PyTuple_GET_ITEM(c->defaults, default_index);
+        }
+
+        if (!value) {
+            PyErr_Format(PyExc_TypeError,
+                         "%s() missing required argument: '%U'", kind_name, name);
             goto error;
         }
         if (PyDict_SetItem(locals, name, value) < 0) goto error;
     }
 
+    /* *args receives every extra positional argument as a tuple. */
     if (vararg_name != Py_None) {
-        PyObject *extra = PyTuple_GetSlice(args, total_pos, PyTuple_GET_SIZE(args));
+        PyObject *extra = PyTuple_GetSlice(args, total_pos, arg_count);
         if (!extra) goto error;
-        if (PyDict_SetItem(locals, vararg_name, extra) < 0) { Py_DECREF(extra); goto error; }
+        if (PyDict_SetItem(locals, vararg_name, extra) < 0) {
+            Py_DECREF(extra);
+            goto error;
+        }
         Py_DECREF(extra);
     }
 
+    /* Keyword-only parameters, including their defaults. */
     for (Py_ssize_t i = total_pos; i < total_pos + kwonly; ++i) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
         PyObject *value = kwargs ? PyDict_GetItemWithError(kwargs, name) : NULL;
-        if (!value && PyErr_Occurred()) goto error;
-        if (!value && c->kwdefaults) value = PyDict_GetItemWithError(c->kwdefaults, name);
+        if (!value && kwargs && PyErr_Occurred()) goto error;
+
+        if (!value && c->kwdefaults)
+            value = PyDict_GetItemWithError(c->kwdefaults, name);
+
         if (!value) {
-            PyErr_Format(PyExc_TypeError, "%s() missing required keyword-only argument: '%U'", kind_name, name);
+            PyErr_Format(PyExc_TypeError,
+                         "%s() missing required keyword-only argument: '%U'",
+                         kind_name, name);
             goto error;
         }
         if (PyDict_SetItem(locals, name, value) < 0) goto error;
     }
 
-    if (kwarg_name != Py_None) {
-        PyObject *extra = PyDict_New();
-        if (!extra) goto error;
-        if (kwargs) {
-            PyObject *key, *value;
-            Py_ssize_t p = 0;
-            while (PyDict_Next(kwargs, &p, &key, &value)) {
-                int formal = PySequence_Contains(names, key);
-                if (formal < 0) { Py_DECREF(extra); goto error; }
-                if (!formal) {
-                    if (PyDict_SetItem(extra, key, value) < 0) { Py_DECREF(extra); goto error; }
+    /* Collect unknown keywords into **kwargs, or reject them if absent. */
+    PyObject *extra_kwargs = PyDict_New();
+    if (!extra_kwargs) goto error;
+
+    if (kwargs) {
+        PyObject *key, *value;
+        Py_ssize_t p = 0;
+        while (PyDict_Next(kwargs, &p, &key, &value)) {
+            int formal = PySequence_Contains(names, key);
+            if (formal < 0) {
+                Py_DECREF(extra_kwargs);
+                goto error;
+            }
+            if (!formal) {
+                if (PyDict_SetItem(extra_kwargs, key, value) < 0) {
+                    Py_DECREF(extra_kwargs);
+                    goto error;
                 }
             }
         }
-        if (PyDict_SetItem(locals, kwarg_name, extra) < 0) { Py_DECREF(extra); goto error; }
-        Py_DECREF(extra);
     }
 
-    PXState state = {PX_NORMAL, 0};
-    PyObject *result = px_eval(n->left, locals, &state);
-    if (result && state.flow == PX_RETURN) {
-        /* Return is intentionally not part of the first def/call milestone.
-           Keep the existing runtime path isolated so later return support can
-           be added without changing function construction/calling. */
-        state.flow = PX_NORMAL;
+    if (kwarg_name != Py_None) {
+        if (PyDict_SetItem(locals, kwarg_name, extra_kwargs) < 0) {
+            Py_DECREF(extra_kwargs);
+            goto error;
+        }
+    } else if (PyDict_GET_SIZE(extra_kwargs) != 0) {
+        PyObject *key = PyDict_NextKey(extra_kwargs);
+        PyErr_Format(PyExc_TypeError,
+                     "%s() got an unexpected keyword argument '%U'",
+                     kind_name, key);
+        Py_DECREF(extra_kwargs);
+        goto error;
     }
-    Py_DECREF(locals);
-    if (owns_callable_name) Py_DECREF(callable_name);
-    return result;
+    Py_DECREF(extra_kwargs);
+
+    {
+        PXState state = {PX_NORMAL, 0};
+        PyObject *result = px_eval(n->left, locals, &state);
+        Py_DECREF(locals);
+        if (owns_callable_name) Py_DECREF(callable_name);
+        return result;
+    }
+
 error:
     Py_DECREF(locals);
+error_no_locals:
     if (owns_callable_name) Py_DECREF(callable_name);
     return NULL;
 }
