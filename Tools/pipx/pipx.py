@@ -447,129 +447,200 @@ def version_satisfies(version: str, constraints: list[tuple[str, str]]) -> bool:
     return True
 
 
-def install_package(name: str, requested_version: str | None, os_build: bool, indexes_list: list[str] | None = None, no_deps: bool = False, seen: set[str] | None = None, dependency_constraints: list[tuple[str, str]] | None = None) -> None:
-    indexes_list = indexes_list or [PYPI_SIMPLE]
-    seen = seen or set()
-    if normalize(name) in seen:
-        return
-    seen.add(normalize(name))
-    data, source_index = package_data(name, indexes_list)
-    project = data.get("info", {})
-    canonical = project.get("name", name)
-    distribution = choose_distribution(data, requested_version, dependency_constraints)
+def resolve_dependencies(
+    root_name: str,
+    root_version: str | None,
+    os_build: bool,
+    indexes_list: list[str],
+    no_deps: bool,
+) -> dict[str, tuple[dict[str, Any], dict[str, Any], list[tuple[str, str]]]]:
+    """Resolve the complete dependency graph before changing site-packages.
 
-    with tempfile.TemporaryDirectory(prefix="pythonx-pipx-") as tmp:
-        tmpdir = Path(tmp)
-        archive = tmpdir / distribution["filename"]
+    This deliberately resolves first and installs second, so a conflict
+    cannot leave PythonX half-updated.
+    """
+    requirements: dict[str, list[tuple[str, str]]] = {normalize(root_name): []}
+    requested: dict[str, str | None] = {normalize(root_name): root_version}
+    names: dict[str, str] = {normalize(root_name): root_name}
+    resolved: dict[str, tuple[dict[str, Any], dict[str, Any], list[tuple[str, str]]]] = {}
 
-        print(
-            f"pipx: downloading {canonical} "
-            f"{distribution.get('version', requested_version or '')}..."
-        )
-        download(distribution["url"], archive)
-        verify_hash(
-            archive,
-            distribution.get("digests", {}).get("sha256")
-            and f"sha256={distribution['digests']['sha256']}",
-        )
-
-        if os_build and distribution["packagetype"] == "bdist_wheel":
-            check_os_compatibility(
-                data,
-                distribution["filename"],
-                read_wheel_metadata(archive),
-            )
-
-        staging = tmpdir / "staging"
-        if distribution["packagetype"] == "bdist_wheel":
-            extract_wheel(archive, staging)
-        else:
-            source = extract_archive(archive, staging)
-            build = subprocess.run(
-                [
-                    sys.executable, "-m", "pip", "wheel",
-                    "--no-deps", "--no-build-isolation",
-                    "--wheel-dir", str(tmpdir / "wheel"), str(source),
-                ],
-                text=True,
-                capture_output=True,
-            )
-            if build.returncode != 0:
+    for _ in range(100):
+        changed = False
+        for key in list(requirements):
+            name = names[key]
+            data, source_index = package_data(name, indexes_list)
+            project = data.get("info", {})
+            canonical = project.get("name", name)
+            constraints = requirements[key]
+            distribution = choose_distribution(data, requested.get(key), constraints)
+            version = distribution.get("version") or project.get("version", "")
+            if not version_satisfies(version, constraints):
                 raise RuntimeError(
-                    "PythonX pipx: source distribution requires a build backend; "
-                    "wheel build failed.\n" + build.stderr.strip()
+                    f"PythonX pipx: dependency conflict for {canonical}: "
+                    f"no release satisfies {constraints!r}."
                 )
-            built = sorted((tmpdir / "wheel").glob("*.whl"))
-            if not built:
-                raise RuntimeError("PythonX pipx: build backend produced no wheel.")
-            staging = tmpdir / "wheel-staging"
-            extract_wheel(built[0], staging)
+            previous = resolved.get(key)
+            current = (data, distribution, constraints)
+            if previous is None or previous[1].get("filename") != distribution.get("filename"):
+                resolved[key] = current
+                changed = True
 
-        target = packages_dir()
-        target.mkdir(parents=True, exist_ok=True)
-
-        # Install the complete wheel contents into PythonX's real
-        # site-packages. A distribution may contain multiple top-level
-        # packages, namespace fragments, .pth files, and dist-info.
-        old_meta_path = metadata_path(canonical)
-        if old_meta_path.exists():
-            try:
-                old_meta = json.loads(old_meta_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                old_meta = {}
-            for relative in old_meta.get("installed_files", []):
-                old_file = target / relative
-                if old_file.is_file() or old_file.is_symlink():
-                    old_file.unlink()
-
-        installed_files: list[str] = []
-        for source in staging.rglob("*"):
-            relative = source.relative_to(staging)
-            destination = target / relative
-            if source.is_dir():
-                destination.mkdir(parents=True, exist_ok=True)
+            if no_deps:
                 continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists() or destination.is_symlink():
-                if destination.is_dir() and not destination.is_symlink():
-                    shutil.rmtree(destination)
-                else:
-                    destination.unlink()
-            shutil.copy2(source, destination)
-            installed_files.append(relative.as_posix())
 
-    metadata_dir().mkdir(parents=True, exist_ok=True)
-    meta = package_metadata(
-        canonical,
-        project.get("version", requested_version or ""),
-        os_build,
-        summary=project.get("summary", ""),
-        requires_dist=project.get("requires_dist", []) or [],
-        distribution=distribution["filename"],
-        source_index=source_index,
-        installed_files=installed_files,
-    )
-    metadata_path(canonical).write_text(
-        json.dumps(meta, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+            requires = project.get("requires_dist", []) or []
+            if distribution.get("packagetype") == "bdist_wheel":
+                # Wheel metadata is authoritative when available.
+                try:
+                    with tempfile.TemporaryDirectory(prefix="pythonx-pipx-resolve-") as tmp:
+                        archive = Path(tmp) / distribution["filename"]
+                        download(distribution["url"], archive)
+                        wheel_meta = read_wheel_metadata(archive)
+                        requires = wheel_meta.get("Requires-Dist", requires)
+                except Exception:
+                    pass
 
-    if not no_deps:
-        for requirement in meta.get("requires_dist", []):
-            dep_name, constraints, marker = requirement_parts(requirement)
-            if not marker_matches(marker):
-                continue
-            dep_meta_file = metadata_path(dep_name)
-            if dep_meta_file.exists():
-                installed = load_metadata(dep_name)
-                if version_satisfies(installed.get("version", ""), constraints):
+            for requirement in requires:
+                dep_name, dep_constraints, marker = requirement_parts(requirement)
+                if not marker_matches(marker):
                     continue
-            install_package(dep_name, None, os_build, indexes_list, False, seen, constraints)
+                dep_key = normalize(dep_name)
+                names.setdefault(dep_key, dep_name)
+                bucket = requirements.setdefault(dep_key, [])
+                for constraint in dep_constraints:
+                    if constraint not in bucket:
+                        bucket.append(constraint)
+                        changed = True
 
-    print(f"pipx: installed {canonical} into PythonX environment: {target}")
+        # Re-check every selected version against all constraints. This
+        # catches transitive conflicts instead of silently overwriting them.
+        for key, (_, distribution, constraints) in resolved.items():
+            version = distribution.get("version", "")
+            if not version_satisfies(version, constraints):
+                requested[key] = None
+                changed = True
+
+        if not changed:
+            return resolved
+
+    raise RuntimeError("PythonX pipx: dependency resolution did not converge.")
+
+
+def install_package(
+    name: str,
+    requested_version: str | None,
+    os_build: bool,
+    indexes_list: list[str] | None = None,
+    no_deps: bool = False,
+    seen: set[str] | None = None,
+    dependency_constraints: list[tuple[str, str]] | None = None,
+) -> None:
+    indexes_list = indexes_list or [PYPI_SIMPLE]
+    constraints = dependency_constraints or []
+    resolved = resolve_dependencies(name, requested_version, os_build, indexes_list, no_deps)
+
+    # Resolve everything before touching the environment.
+    for key, (data, distribution, _) in resolved.items():
+        project = data.get("info", {})
+        canonical = project.get("name", namesafe := key)
+        if os_build and distribution["packagetype"] == "bdist_wheel":
+            with tempfile.TemporaryDirectory(prefix="pythonx-pipx-os-") as tmp:
+                archive = Path(tmp) / distribution["filename"]
+                download(distribution["url"], archive)
+                check_os_compatibility(data, distribution["filename"], read_wheel_metadata(archive))
+        print(f"pipx: resolved {canonical} {distribution.get('version', '')}")
+
+    for key, (data, distribution, _) in resolved.items():
+        project = data.get("info", {})
+        canonical = project.get("name", key)
+        with tempfile.TemporaryDirectory(prefix="pythonx-pipx-") as tmp:
+            tmpdir = Path(tmp)
+            archive = tmpdir / distribution["filename"]
+            print(f"pipx: downloading {canonical} {distribution.get('version', '')}...")
+            download(distribution["url"], archive)
+            verify_hash(
+                archive,
+                distribution.get("digests", {}).get("sha256")
+                and f"sha256={distribution['digests']['sha256']}",
+            )
+            if os_build and distribution["packagetype"] == "bdist_wheel":
+                check_os_compatibility(data, distribution["filename"], read_wheel_metadata(archive))
+
+            staging = tmpdir / "staging"
+            if distribution["packagetype"] == "bdist_wheel":
+                extract_wheel(archive, staging)
+            else:
+                source = extract_archive(archive, staging)
+                build = subprocess.run(
+                    [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
+                     "--wheel-dir", str(tmpdir / "wheel"), str(source)],
+                    text=True, capture_output=True,
+                )
+                if build.returncode != 0:
+                    raise RuntimeError(
+                        "PythonX pipx: source distribution requires a build backend; "
+                        "wheel build failed.\n" + build.stderr.strip()
+                    )
+                built = sorted((tmpdir / "wheel").glob("*.whl"))
+                if not built:
+                    raise RuntimeError("PythonX pipx: build backend produced no wheel.")
+                staging = tmpdir / "wheel-staging"
+                extract_wheel(built[0], staging)
+
+            target = packages_dir()
+            target.mkdir(parents=True, exist_ok=True)
+            old_meta_path = metadata_path(canonical)
+            if old_meta_path.exists():
+                try:
+                    old_meta = json.loads(old_meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    old_meta = {}
+                for relative in old_meta.get("installed_files", []):
+                    old_file = target / relative
+                    if old_file.is_file() or old_file.is_symlink():
+                        old_file.unlink()
+
+            installed_files: list[str] = []
+            for source_file in staging.rglob("*"):
+                relative = source_file.relative_to(staging)
+                destination = target / relative
+                if source_file.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists() or destination.is_symlink():
+                    if destination.is_dir() and not destination.is_symlink():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+                shutil.copy2(source_file, destination)
+                installed_files.append(relative.as_posix())
+
+        metadata_dir().mkdir(parents=True, exist_ok=True)
+        meta = package_metadata(
+            canonical,
+            project.get("version", distribution.get("version", "")),
+            os_build,
+            summary=project.get("summary", ""),
+            requires_dist=project.get("requires_dist", []) or [],
+            distribution=distribution["filename"],
+            source_index=data.get("_source_index", ""),
+            installed_files=installed_files,
+            dependencies=[
+                resolved_dep.get("name", dep_key)
+                for dep_key, resolved_dep in (
+                    (k, resolved[k][0].get("info", {})) for k in resolved if k != key
+                )
+            ],
+        )
+        metadata_path(canonical).write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    print(f"pipx: installed {len(resolved)} package(s) into PythonX environment: {packages_dir()}")
     if os_build:
-        print("pipx: marked for PythonX OS build.")
-
+        print("pipx: marked resolved packages for PythonX OS build.")
 
 def update_package(name: str, requested_version: str | None, os_build: bool | None, indexes_list: list[str] | None = None, no_deps: bool = False) -> None:
     old = load_metadata(name)
