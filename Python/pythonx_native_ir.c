@@ -2018,9 +2018,9 @@ PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
      */
     unsigned char code[96];
     size_t p=0;
-    size_t root_literal=24;
-    size_t globals_literal=32;
-    size_t callee_literal=40;
+    size_t root_literal=32;
+    size_t globals_literal=40;
+    size_t callee_literal=48;
 
     PyObject*g=f->globals?Py_NewRef(f->globals):PyDict_New();
     if(!g)return NULL;
@@ -2032,6 +2032,7 @@ PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
     emit_u32(code,&p,0x00008067u);    /* ret: jalr x0, ra, 0 */
 
     while(p<root_literal) code[p++]=0;
+    memcpy(code+root_literal, &f->root, sizeof(f->root));
     memcpy(code+globals_literal, &g, sizeof(g));
     memcpy(code+callee_literal, &(uintptr_t){(uintptr_t)&_PyX_NativeEvaluateIR}, sizeof(uintptr_t));
 
