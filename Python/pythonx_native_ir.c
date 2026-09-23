@@ -1892,7 +1892,7 @@ static size_t emit_mov64(unsigned char *code, size_t p, unsigned int reg, uint64
     for (unsigned int part = 0; part < 4; ++part) {
         uint32_t instruction = (part == 0 ? 0xD2800000u : 0xF2800000u)
             | (((value >> (part * 16)) & 0xFFFFu) << 5)
-            | (part * 16u << 16)
+            | (part << 21)
             | reg;
         memcpy(code + p, &instruction, sizeof(instruction));
         p += sizeof(instruction);
