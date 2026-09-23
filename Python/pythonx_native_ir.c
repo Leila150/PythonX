@@ -1920,7 +1920,11 @@ PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
     void*m=alloc_exec(p);
     if(!m){Py_DECREF(g);PyErr_SetString(PyExc_MemoryError,"PythonX could not allocate executable memory");return NULL;}
     memcpy(m,code,p);
+#if defined(_WIN32)
+    FlushInstructionCache(GetCurrentProcess(),m,p);
+#else
     __builtin___clear_cache((char *)m,(char *)m+p);
+#endif
 
     XIRNativeCode*n=PyMem_RawMalloc(sizeof(*n));
     if(!n){free_exec(m,p);Py_DECREF(g);PyErr_NoMemory();return NULL;}
