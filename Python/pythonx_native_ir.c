@@ -110,6 +110,307 @@ static PyObject *px_function_descr_get(PyObject *self, PyObject *obj, PyObject *
     return PyMethod_New(self, obj);
 }
 
+
+/*
+ * PythonX special-method bridge.
+ *
+ * Python's implicit special-method lookup is performed on the type rather than
+ * through ordinary instance attribute lookup.  PythonX functions are native
+ * callables, so CPython's type slot machinery cannot treat them exactly like
+ * PyFunctionObject instances.  We therefore install real CPython function
+ * wrappers for PythonX dunder methods.  The wrapper is what CPython sees in
+ * number/sequence/mapping/async slots; it dispatches to the original PythonX
+ * function stored under a private name.
+ *
+ * This covers the Python data-model surface without changing PythonX's
+ * function implementation or replacing the user's method bodies.
+ */
+static PyObject *px_dunder_wrappers;
+
+static PyObject *px_dunder_dispatch(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    if (!PyTuple_Check(args)) {
+        PyErr_SetString(PyExc_TypeError, "PythonX dunder dispatcher received invalid arguments");
+        return NULL;
+    }
+
+    PyObject *name = NULL;
+    PyObject *owner = NULL;
+
+    /*
+     * Instance special methods live on type(self).  Class-level hooks such as
+     * __class_getitem__ and __init_subclass__ live on the class object itself.
+     */
+    if (PyType_Check(self))
+        owner = Py_NewRef(self);
+    else
+        owner = Py_NewRef((PyObject *)Py_TYPE(self));
+
+    name = PyObject_Str(PyTuple_GET_ITEM(args, 0));
+    if (!name) {
+        Py_DECREF(owner);
+        return NULL;
+    }
+
+    PyObject *hidden = PyUnicode_FromFormat("__pythonx_dunder_%U", name);
+    Py_DECREF(name);
+    if (!hidden) {
+        Py_DECREF(owner);
+        return NULL;
+    }
+
+    PyObject *target = PyObject_GetAttr(owner, hidden);
+    Py_DECREF(hidden);
+    Py_DECREF(owner);
+    if (!target)
+        return NULL;
+
+    /*
+     * The original PythonX function is a descriptor.  Looking it up on the
+     * class above returns the unbound PythonX callable, so prepend self/cls.
+     */
+    Py_ssize_t argc = PyTuple_GET_SIZE(args);
+    if (argc < 1) {
+        Py_DECREF(target);
+        PyErr_SetString(PyExc_TypeError, "PythonX dunder wrapper requires a receiver");
+        return NULL;
+    }
+
+    PyObject *call_args = PyTuple_New(argc);
+    if (!call_args) {
+        Py_DECREF(target);
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < argc; ++i)
+        PyTuple_SET_ITEM(call_args, i, Py_NewRef(PyTuple_GET_ITEM(args, i)));
+
+    PyObject *result = PyObject_Call(target, call_args, kwargs);
+    Py_DECREF(call_args);
+    Py_DECREF(target);
+    return result;
+}
+
+static PyObject *px_make_dunder_wrapper(const char *name)
+{
+    if (!px_dunder_wrappers) {
+        px_dunder_wrappers = PyDict_New();
+        if (!px_dunder_wrappers)
+            return NULL;
+    }
+
+    PyObject *key = PyUnicode_FromString(name);
+    if (!key)
+        return NULL;
+
+    PyObject *cached = PyDict_GetItemWithError(px_dunder_wrappers, key);
+    if (cached) {
+        Py_INCREF(cached);
+        Py_DECREF(key);
+        return cached;
+    }
+    if (PyErr_Occurred()) {
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    /*
+     * Every generated wrapper is an actual Python function.  CPython therefore
+     * installs the appropriate implicit type slots when the class is created.
+     */
+    PyObject *globals = PyDict_New();
+    if (!globals) {
+        Py_DECREF(key);
+        return NULL;
+    }
+    PyObject *builtins = PyEval_GetBuiltins();
+    if (builtins && PyDict_SetItemString(globals, "__builtins__", builtins) < 0) {
+        Py_DECREF(globals);
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    static PyMethodDef dispatch_def = {
+        "__pythonx_dispatch__",
+        (PyCFunction)px_dunder_dispatch,
+        METH_VARARGS | METH_KEYWORDS,
+        NULL
+    };
+    PyObject *dispatch = PyCFunction_New(&dispatch_def, NULL);
+    if (!dispatch) {
+        Py_DECREF(globals);
+        Py_DECREF(key);
+        return NULL;
+    }
+    if (PyDict_SetItemString(globals, "__pythonx_dispatch__", dispatch) < 0) {
+        Py_DECREF(dispatch);
+        Py_DECREF(globals);
+        Py_DECREF(key);
+        return NULL;
+    }
+    Py_DECREF(dispatch);
+
+    PyObject *source = PyUnicode_FromFormat(
+        "def %s(self, *args, **kwargs):\n"
+        "    return __pythonx_dispatch__(self, (%s,), args, kwargs)\n",
+        name, name);
+    if (!source) {
+        Py_DECREF(globals);
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    PyObject *filename = PyUnicode_FromString("<pythonx-dunder>");
+    PyObject *code = Py_CompileStringObject(
+        PyUnicode_AsUTF8(source),
+        filename,
+        Py_file_input,
+        NULL,
+        -1);
+    Py_DECREF(filename);
+    Py_DECREF(source);
+    if (!code) {
+        Py_DECREF(globals);
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    PyObject *result = PyEval_EvalCode(code, globals, globals);
+    Py_DECREF(code);
+    Py_DECREF(globals);
+    if (!result) {
+        Py_DECREF(key);
+        return NULL;
+    }
+
+    PyObject *wrapper = PyDict_GetItemWithError(result, key);
+    if (!wrapper) {
+        Py_DECREF(result);
+        Py_DECREF(key);
+        if (!PyErr_Occurred())
+            PyErr_SetString(PyExc_RuntimeError, "PythonX failed to create dunder wrapper");
+        return NULL;
+    }
+
+    Py_INCREF(wrapper);
+    if (PyDict_SetItem(px_dunder_wrappers, key, wrapper) < 0) {
+        Py_DECREF(wrapper);
+        Py_DECREF(result);
+        Py_DECREF(key);
+        return NULL;
+    }
+    Py_DECREF(result);
+    Py_DECREF(key);
+    return wrapper;
+}
+
+static int px_bridge_dunder_namespace(PyObject *namespace)
+{
+    /*
+     * This is the broad Python data-model set.  The wrappers are only installed
+     * when the class actually defines that dunder, so ordinary Python classes
+     * retain their normal behavior.
+     */
+    static const char *const dunders[] = {
+        "__new__", "__init__", "__del__",
+        "__repr__", "__str__", "__bytes__", "__format__", "__bool__",
+        "__hash__", "__sizeof__", "__dir__", "__getattribute__",
+        "__getattr__", "__setattr__", "__delattr__",
+        "__lt__", "__le__", "__eq__", "__ne__", "__gt__", "__ge__",
+        "__cmp__",
+        "__add__", "__sub__", "__mul__", "__matmul__", "__truediv__",
+        "__floordiv__", "__mod__", "__divmod__", "__pow__",
+        "__lshift__", "__rshift__", "__and__", "__xor__", "__or__",
+        "__neg__", "__pos__", "__abs__", "__invert__", "__index__",
+        "__round__", "__trunc__", "__floor__", "__ceil__",
+        "__complex__", "__int__", "__float__",
+        "__iadd__", "__isub__", "__imul__", "__imatmul__", "__itruediv__",
+        "__ifloordiv__", "__imod__", "__ipow__", "__ilshift__",
+        "__irshift__", "__iand__", "__ixor__", "__ior__",
+        "__radd__", "__rsub__", "__rmul__", "__rmatmul__", "__rtruediv__",
+        "__rfloordiv__", "__rmod__", "__rdivmod__", "__rpow__",
+        "__rlshift__", "__rrshift__", "__rand__", "__rxor__", "__ror__",
+        "__len__", "__length_hint__", "__getitem__", "__setitem__",
+        "__delitem__", "__missing__", "__iter__", "__next__", "__reversed__",
+        "__contains__", "__call__",
+        "__enter__", "__exit__", "__aenter__", "__aexit__",
+        "__await__", "__aiter__", "__anext__",
+        "__get__", "__set__", "__delete__", "__set_name__",
+        "__instancecheck__", "__subclasscheck__", "__subclasses__",
+        "__init_subclass__", "__class_getitem__", "__mro_entries__",
+        "__prepare__", "__instancecheck__", "__subclasscheck__",
+        "__reduce__", "__reduce_ex__", "__getnewargs__", "__getnewargs_ex__",
+        "__getstate__", "__setstate__", "__copy__", "__deepcopy__",
+        "__replace__", "__class__", "__dict__", "__weakref__",
+        "__slots__", "__annotations__", "__match_args__",
+        "__fspath__", "__enter__", "__exit__",
+        "__getformat__", "__setformat__"
+    };
+
+    const Py_ssize_t count = (Py_ssize_t)(sizeof(dunders) / sizeof(dunders[0]));
+    for (Py_ssize_t i = 0; i < count; ++i) {
+        PyObject *name = PyUnicode_FromString(dunders[i]);
+        if (!name)
+            return -1;
+
+        PyObject *value = PyDict_GetItemWithError(namespace, name);
+        if (!value) {
+            Py_DECREF(name);
+            if (PyErr_Occurred())
+                return -1;
+            continue;
+        }
+
+        /*
+         * Only PythonX functions need bridging.  Decorators such as
+         * @staticmethod, @classmethod, @property and native descriptors are
+         * already understood by CPython and must be left untouched.
+         */
+        if (!PyObject_TypeCheck(value, &PyXFunction_Type)) {
+            Py_DECREF(name);
+            continue;
+        }
+
+        PyObject *hidden = PyUnicode_FromFormat("__pythonx_dunder_%s", dunders[i]);
+        if (!hidden) {
+            Py_DECREF(name);
+            return -1;
+        }
+
+        if (PyDict_SetItem(namespace, hidden, value) < 0) {
+            Py_DECREF(hidden);
+            Py_DECREF(name);
+            return -1;
+        }
+
+        PyObject *wrapper = px_make_dunder_wrapper(dunders[i]);
+        if (!wrapper) {
+            Py_DECREF(hidden);
+            Py_DECREF(name);
+            return -1;
+        }
+
+        /*
+         * Keep introspection useful: wrapper.__wrapped__ points at the actual
+         * PythonX function that contains the user's implementation.
+         */
+        if (PyObject_SetAttrString(wrapper, "__wrapped__", value) < 0) {
+            PyErr_Clear();
+        }
+
+        if (PyDict_SetItem(namespace, name, wrapper) < 0) {
+            Py_DECREF(wrapper);
+            Py_DECREF(hidden);
+            Py_DECREF(name);
+            return -1;
+        }
+
+        Py_DECREF(wrapper);
+        Py_DECREF(hidden);
+        Py_DECREF(name);
+    }
+    return 0;
+}
+
 static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
 {
     PyObject *meta = n->constant;
