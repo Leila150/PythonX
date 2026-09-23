@@ -2162,6 +2162,10 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             expr->op == PYX_IR_GT || expr->op == PYX_IR_GE)
             goto emit_compare;
 
+        if (expr->op == PYX_IR_TRUEDIV || expr->op == PYX_IR_FLOORDIV ||
+            expr->op == PYX_IR_MOD)
+            goto emit_divmod;
+
         PyObject *va = PyLong_FromLongLong(a);
         PyObject *vb = PyLong_FromLongLong(b);
         PyObject *vres = NULL;
@@ -2257,6 +2261,68 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
     }
     return NULL;
 
+emit_divmod:
+        {
+            PyObject *va = PyLong_FromLongLong(a);
+            PyObject *vb = PyLong_FromLongLong(b);
+            PyObject *vres = NULL;
+            if (!va || !vb) {
+                Py_XDECREF(va);
+                Py_XDECREF(vb);
+                return NULL;
+            }
+            if (expr->op == PYX_IR_TRUEDIV)
+                vres = PyNumber_TrueDivide(va, vb);
+            else if (expr->op == PYX_IR_FLOORDIV)
+                vres = PyNumber_FloorDivide(va, vb);
+            else
+                vres = PyNumber_Remainder(va, vb);
+            Py_DECREF(va);
+            Py_DECREF(vb);
+            if (!vres)
+                return NULL;
+
+            if (expr->op == PYX_IR_TRUEDIV) {
+                Py_DECREF(vres);
+                goto emit_value;
+            }
+
+            if (!PyLong_Check(vres)) {
+                Py_DECREF(vres);
+                goto emit_value;
+            }
+
+            {
+                int overflow = 0;
+                long long q = PyLong_AsLongLongAndOverflow(vres, &overflow);
+                Py_DECREF(vres);
+                if (overflow || PyErr_Occurred())
+                    goto emit_value;
+
+#if defined(_WIN32)
+                code[p++]=0x48; code[p++]=0xB8;
+                memcpy(code+p,&a,8); p+=8;
+                code[p++]=0x49; code[p++]=0xB8;
+                memcpy(code+p,&b,8); p+=8;
+                code[p++]=0x48; code[p++]=0x99; /* cqo */
+                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8; /* idiv r8 */
+#else
+                code[p++]=0x48; code[p++]=0xB8;
+                memcpy(code+p,&a,8); p+=8;
+                code[p++]=0x49; code[p++]=0xB8;
+                memcpy(code+p,&b,8); p+=8;
+                code[p++]=0x48; code[p++]=0x99; /* cqo */
+                code[p++]=0x49; code[p++]=0xF7; code[p++]=0xF8; /* idiv r8 */
+#endif
+                if (expr->op == PYX_IR_MOD)
+                    code[p++]=0x48; /* placeholder handled below */
+                if (expr->op == PYX_IR_MOD) {
+                    code[p-1]=0x4C; code[p++]=0x89; code[p++]=0xC0; /* mov rax,r8 -- replaced below */
+                }
+                goto emit_long_call_with_value;
+            }
+        }
+
 emit_compare:
 #if defined(_WIN32)
         code[p++]=0x48; code[p++]=0xB8;
@@ -2317,6 +2383,14 @@ emit_bool_call:
     code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x08;
 #endif
     code[p++]=0xC3;
+
+emit_long_call_with_value:
+#if defined(_WIN32)
+        code[p++]=0x48; code[p++]=0x89; code[p++]=0xC1;
+#else
+        code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7;
+#endif
+        goto emit_call;
 
 emit_call:
 #if defined(_WIN32)
