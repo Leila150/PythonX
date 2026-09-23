@@ -209,7 +209,9 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
             goto error;
         }
     } else if (PyDict_GET_SIZE(extra_kwargs) != 0) {
-        PyObject *key = PyDict_NextKey(extra_kwargs);
+        PyObject *key = NULL, *value = NULL;
+        Py_ssize_t pos = 0;
+        (void)PyDict_Next(extra_kwargs, &pos, &key, &value);
         PyErr_Format(PyExc_TypeError,
                      "%s() got an unexpected keyword argument '%U'",
                      kind_name, key);
