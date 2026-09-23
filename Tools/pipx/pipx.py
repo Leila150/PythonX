@@ -272,11 +272,11 @@ def load_metadata(name: str) -> dict[str, Any]:
 
 
 def installed_names() -> list[str]:
-    if not packages_dir().exists():
+    if not metadata_dir().exists():
         return []
     return sorted(
-        p.name for p in packages_dir().iterdir()
-        if p.is_dir() and metadata_path(p.name).exists()
+        p.stem for p in metadata_dir().glob("*.json")
+        if p.is_file()
     )
 
 
@@ -446,11 +446,38 @@ def install_package(name: str, requested_version: str | None, os_build: bool, in
             staging = tmpdir / "wheel-staging"
             extract_wheel(built[0], staging)
 
-        target = installed_path(canonical)
-        packages_dir().mkdir(parents=True, exist_ok=True)
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.copytree(staging, target)
+        target = packages_dir()
+        target.mkdir(parents=True, exist_ok=True)
+
+        # Install the complete wheel contents into PythonX's real
+        # site-packages. A distribution may contain multiple top-level
+        # packages, namespace fragments, .pth files, and dist-info.
+        old_meta_path = metadata_path(canonical)
+        if old_meta_path.exists():
+            try:
+                old_meta = json.loads(old_meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                old_meta = {}
+            for relative in old_meta.get("installed_files", []):
+                old_file = target / relative
+                if old_file.is_file() or old_file.is_symlink():
+                    old_file.unlink()
+
+        installed_files: list[str] = []
+        for source in staging.rglob("*"):
+            relative = source.relative_to(staging)
+            destination = target / relative
+            if source.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists() or destination.is_symlink():
+                if destination.is_dir() and not destination.is_symlink():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            shutil.copy2(source, destination)
+            installed_files.append(relative.as_posix())
 
     metadata_dir().mkdir(parents=True, exist_ok=True)
     meta = package_metadata(
@@ -460,6 +487,8 @@ def install_package(name: str, requested_version: str | None, os_build: bool, in
         summary=project.get("summary", ""),
         requires_dist=project.get("requires_dist", []) or [],
         distribution=distribution["filename"],
+        source_index=source_index,
+        installed_files=installed_files,
     )
     metadata_path(canonical).write_text(
         json.dumps(meta, indent=2, sort_keys=True) + "\n",
@@ -495,11 +524,21 @@ def reinstall_package(name: str) -> None:
 
 def uninstall(name: str) -> None:
     meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    if target.exists():
-        shutil.rmtree(target)
+    target = packages_dir()
+    for relative in meta.get("installed_files", []):
+        path = target / relative
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    for relative in sorted(meta.get("installed_files", []), reverse=True):
+        parent = (target / relative).parent
+        while parent != target and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
     metadata_path(meta["name"]).unlink(missing_ok=True)
-    print(f"pipx: removed {meta['name']}")
+    print(f"pipx: removed {meta['name']} from PythonX")
 
 
 def edit_package(name: str) -> None:
