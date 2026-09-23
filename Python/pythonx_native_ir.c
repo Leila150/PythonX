@@ -14,6 +14,23 @@ typedef enum { PX_NORMAL=0, PX_BREAK, PX_CONTINUE, PX_RETURN } PXFlow;
 typedef struct { PXFlow flow; int loop_depth; } PXState;
 
 static PyObject *px_eval(const PyXIRNode *, PyObject *, PXState *);
+static PyObject *px_name_load(PyObject *globals, PyObject *name)
+{
+    PyObject *value = PyDict_GetItemWithError(globals, name);
+    if (value) return Py_NewRef(value);
+    if (PyErr_Occurred()) return NULL;
+
+    PyObject *builtins = PyEval_GetBuiltins();
+    if (builtins && PyDict_Check(builtins)) {
+        value = PyDict_GetItemWithError(builtins, name);
+        if (value) return Py_NewRef(value);
+        if (PyErr_Occurred()) return NULL;
+    }
+
+    PyErr_Format(PyExc_NameError, "name '%U' is not defined", name);
+    return NULL;
+}
+
 typedef struct {
     const PyXIRNode *node;
     PyObject *globals;
@@ -667,14 +684,8 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
     switch (n->op) {
     case PYX_IR_CONST: return Py_NewRef(n->constant);
     case PYX_IR_SEQUENCE: return px_suite(n, g, s);
-    case PYX_IR_NAME_LOAD: {
-        PyObject *value = PyDict_GetItemWithError(g, n->constant);
-        if (!value) {
-            if (!PyErr_Occurred()) PyErr_Format(PyExc_NameError, "name '%U' is not defined", n->constant);
-            return NULL;
-        }
-        return Py_NewRef(value);
-    }
+    case PYX_IR_NAME_LOAD:
+        return px_name_load(g, n->constant);
     case PYX_IR_AUG_ASSIGN:return px_aug_assign(n,g,s);
     case PYX_IR_ASSIGN_CHAIN: {
         PyObject *value=px_eval(n->left,g,s);
