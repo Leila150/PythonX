@@ -209,7 +209,7 @@ def read_wheel_metadata(archive: Path) -> dict[str, str]:
     for line in text.splitlines():
         if ": " in line:
             key, value = line.split(": ", 1)
-            if key in {"Name", "Version", "Requires-Dist"}:
+            if key in {"Name", "Version", "Requires-Dist", "PythonX-OS-Unsupported"}:
                 result.setdefault(key, value)
     return result
 
@@ -294,6 +294,26 @@ def copy_tree_contents(source: Path, destination: Path) -> None:
             shutil.copytree(item, target)
         else:
             shutil.copy2(item, target)
+
+
+def list_packages() -> None:
+    names = installed_names()
+    if not names:
+        print("pipx: no packages installed.")
+        return
+    for name in names:
+        meta = load_metadata(name)
+        marker = " [OS]" if meta.get("os_build") else ""
+        print(f"{meta['name']}=={meta.get('version', '')}{marker}")
+
+
+def show_environment() -> None:
+    print(f"PythonX home: {home()}")
+    print(f"site-packages: {packages_dir()}")
+    print(f"metadata: {metadata_dir()}")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"Platform: {platform.platform()}")
+    print(f"Packages: {len(installed_names())}")
 
 
 def install_package(name: str, requested_version: str | None, os_build: bool) -> None:
@@ -382,6 +402,18 @@ def update_package(name: str, requested_version: str | None, os_build: bool | No
     install_package(old["name"], requested, use_os)
 
 
+def update_all() -> None:
+    names = installed_names()
+    if not names:
+        print("pipx: no packages installed.")
+        return
+    for name in names:
+        try:
+            update_package(name, None, None)
+        except Exception as exc:
+            print(f"pipx: failed to update {name}: {exc}", file=sys.stderr)
+
+
 def reinstall_package(name: str) -> None:
     meta = load_metadata(name)
     install_package(meta["name"], meta.get("version"), bool(meta.get("os_build", False)))
@@ -400,212 +432,15 @@ def clone_package(name: str, destination: str) -> None:
 
 
 def search_packages(query: str, limit: int) -> None:
-    data = fetch_json(f"{PYPI}/search?q={urllib.parse.quote(query)}")
-    # PyPI's JSON endpoint may not expose search on all mirrors.
-    projects = data.get("projects", [])[:limit]
-    if not projects:
-        print("pipx: no packages found.")
-        return
-    for project in projects:
-        print(f"{project.get('name', '')} {project.get('version', '')}")
-
-
-def outdated_packages() -> None:
-    for name in installed_names():
-        meta = load_metadata(name)
-        try:
-            data = fetch_json(f"{PYPI}/{meta['name']}/json")
-            latest = data.get("info", {}).get("version", "")
-            if latest and latest != meta.get("version", ""):
-                print(f"{meta['name']} {meta.get('version', '')} -> {latest}")
-        except Exception as exc:
-            print(f"{meta['name']}: unable to check ({exc})")
-
-
-def freeze_packages() -> None:
-    for name in installed_names():
-        meta = load_metadata(name)
-        print(f"{meta['name']}=={meta.get('version', '')}")
-
-
-def mark_os(name: str, enabled: bool) -> None:
-    meta = load_metadata(name)
-    meta["os_build"] = enabled
-    meta["updated_at"] = int(time.time())
-    metadata_path(meta["name"]).write_text(
-        json.dumps(meta, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(
-        f"pipx: {meta['name']} is now "
-        f"{'enabled' if enabled else 'disabled'} for PythonX OS builds."
-    )
-
-
-def uninstall(name: str) -> None:
-    meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    if target.exists():
-        shutil.rmtree(target)
-    metadata_path(meta["name"]).unlink(missing_ok=True)
-    print(f"pipx: removed {meta['name']}")
-
-
-def edit_package(name: str) -> None:
-    meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
-    if not editor:
-        editor = "notepad" if os.name == "nt" else "nano"
     try:
-        subprocess.run([editor, str(target)], check=False)
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"PythonX pipx: editor {editor!r} was not found. "
-            "Set EDITOR or VISUAL to your preferred editor."
-        ) from exc
+        data = fetch_json(f"{PYPI}/{urllib.parse.quote(query, safe='')}/json")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            print("pipx: PyPI JSON supports exact package lookup, not general text search.")
+            return
+        raise
+    info = data.get("info", {})
+    print(f"{info.get('name', query)} {info.get('version', '')}")
+    if info.get("summary"):
+        print(info["summary"])
 
-
-def show_package(name: str) -> None:
-    meta = load_metadata(name)
-    print(json.dumps(meta, indent=2, sort_keys=True))
-
-
-def files_package(name: str) -> None:
-    meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    if not target.exists():
-        raise RuntimeError(f"PythonX pipx: package files are missing for {name!r}.")
-    for path in sorted(target.rglob("*")):
-        if path.is_file():
-            print(path.relative_to(target))
-
-
-def verify_package(name: str) -> None:
-    meta = load_metadata(name)
-    target = installed_path(meta["name"])
-    if not target.exists():
-        raise RuntimeError(f"PythonX pipx: package files are missing for {name!r}.")
-    py_files = list(target.rglob("*.py"))
-    print(f"pipx: {meta['name']} {meta.get('version', '')} is installed.")
-    print(f"pipx: {len(py_files)} Python source files found.")
-    print(f"pipx: OS build package: {'yes' if meta.get('os_build') else 'no'}")
-
-
-def clear_packages() -> None:
-    if packages_dir().exists():
-        shutil.rmtree(packages_dir())
-    if metadata_dir().exists():
-        shutil.rmtree(metadata_dir())
-    print("pipx: cleared the PythonX third-party package environment.")
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="pipx",
-        description="Install and manage third-party packages in a PythonX environment.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    install = sub.add_parser("install", help="Install PythonX or a third-party package.")
-    install.add_argument("package")
-    install.add_argument("--version", "-v", dest="version")
-    install.add_argument(
-        "-os", "--os", action="store_true", dest="os_build",
-        help="Install for a PythonX OS build.",
-    )
-
-    update = sub.add_parser("update", aliases=["upgrade"], help="Update an installed package.")
-    update.add_argument("package")
-    update.add_argument("--version", "-v", dest="version")
-    update.add_argument("-os", "--os", action="store_true", dest="os_build")
-    update.add_argument("--no-os", action="store_false", dest="os_build")
-    update.set_defaults(os_build=None)
-
-    sub.add_parser("list", aliases=["ls"], help="List installed packages.")
-
-    remove = sub.add_parser("remove", aliases=["uninstall", "rm"], help="Uninstall a package.")
-    remove.add_argument("package")
-
-    edit = sub.add_parser("edit", help="Open an installed package in the configured editor.")
-    edit.add_argument("package")
-
-    show = sub.add_parser("show", aliases=["info"], help="Show package metadata.")
-    show.add_argument("package")
-
-    files = sub.add_parser("files", help="List files installed by a package.")
-    files.add_argument("package")
-
-    verify = sub.add_parser("verify", help="Verify that a package installation is present.")
-    verify.add_argument("package")
-
-    search = sub.add_parser("search", help="Search PyPI for packages.")
-    search.add_argument("query")
-    search.add_argument("--limit", "-n", type=int, default=20)
-
-    sub.add_parser("outdated", help="Show installed packages with newer releases.")
-    sub.add_parser("freeze", help="Print installed packages as requirements.")
-    sub.add_parser("environment", aliases=["env"], help="Show the active PythonX environment.")
-
-    reinstall = sub.add_parser("reinstall", help="Reinstall an installed package.")
-    reinstall.add_argument("package")
-
-    clone = sub.add_parser("clone", help="Copy an installed package to another directory.")
-    clone.add_argument("package")
-    clone.add_argument("destination")
-
-    os_cmd = sub.add_parser("os", help="Control whether an installed package is included in OS builds.")
-    os_sub = os_cmd.add_subparsers(dest="os_action", required=True)
-    os_enable = os_sub.add_parser("enable")
-    os_enable.add_argument("package")
-    os_disable = os_sub.add_parser("disable")
-    os_disable.add_argument("package")
-
-    sub.add_parser("clear", help="Remove all third-party packages from the environment.")
-
-    args = parser.parse_args(argv)
-
-    try:
-        if args.command == "install":
-            install_package(args.package, args.version, args.os_build)
-        elif args.command in {"update", "upgrade"}:
-            update_package(args.package, args.version, args.os_build)
-        elif args.command in {"list", "ls"}:
-            list_packages()
-        elif args.command in {"remove", "uninstall", "rm"}:
-            uninstall(args.package)
-        elif args.command == "edit":
-            edit_package(args.package)
-        elif args.command in {"show", "info"}:
-            show_package(args.package)
-        elif args.command == "files":
-            files_package(args.package)
-        elif args.command == "verify":
-            verify_package(args.package)
-        elif args.command == "search":
-            search_packages(args.query, max(1, args.limit))
-        elif args.command == "outdated":
-            outdated_packages()
-        elif args.command == "freeze":
-            freeze_packages()
-        elif args.command == "reinstall":
-            reinstall_package(args.package)
-        elif args.command == "clone":
-            clone_package(args.package, args.destination)
-        elif args.command == "os":
-            mark_os(args.package, args.os_action == "enable")
-        elif args.command in {"environment", "env"}:
-            show_environment()
-        elif args.command == "clear":
-            clear_packages()
-        return 0
-    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-        print(f"pipx: network error: {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"pipx: error: {exc}", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
