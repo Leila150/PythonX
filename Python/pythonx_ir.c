@@ -277,7 +277,10 @@ static PyXIRNode *lower_with(stmt_ty s, int async_with)
         PyXIRNode *enter = ir_new(async_with ? PYX_IR_ASYNC_WITH_ENTER : PYX_IR_WITH_ENTER);
         if (!enter || set_children(enter, 2) < 0) { ir_free_node(enter); ir_free_node(n); return NULL; }
         enter->children[0] = lower_expr(item->context_expr);
-        enter->children[1] = item->optional_vars ? lower_expr(item->optional_vars) : none_node();
+        /* The optional "as" target is a store target, not a value load. */
+        enter->children[1] = item->optional_vars
+            ? lower_store(item->optional_vars, none_node())
+            : none_node();
         if (!enter->children[0] || !enter->children[1]) { ir_free_node(enter); ir_free_node(n); return NULL; }
         n->children[i] = enter;
     }
