@@ -648,6 +648,16 @@ static PyXIRNode *lower_stmt(stmt_ty s)
     case Return_kind:n=ir_new(PYX_IR_RETURN);if(!n)return NULL;n->left=s->v.Return.value?lower_expr(s->v.Return.value):none_node();if(!n->left){ir_free_node(n);return NULL;}return n;
     case Raise_kind:n=ir_new(s->v.Raise.exc?PYX_IR_RAISE:PYX_IR_RERAISE);if(!n)return NULL;if(s->v.Raise.exc){if(set_children(n,2)<0){ir_free_node(n);return NULL;}n->children[0]=lower_expr(s->v.Raise.exc);n->children[1]=s->v.Raise.cause?lower_expr(s->v.Raise.cause):none_node();if(!n->children[0]||!n->children[1]){ir_free_node(n);return NULL;}}return n;
     case Assert_kind:n=ir_new(PYX_IR_ASSERT);if(!n||set_children(n,2)<0){ir_free_node(n);return NULL;}n->children[0]=lower_expr(s->v.Assert.test);n->children[1]=s->v.Assert.msg?lower_expr(s->v.Assert.msg):none_node();if(!n->children[0]||!n->children[1]){ir_free_node(n);return NULL;}return n;
+    case Import_kind:{
+        Py_ssize_t c=asdl_seq_LEN(s->v.Import.names); n=ir_new(PYX_IR_IMPORT);
+        if(!n)return NULL; n->constant=PyTuple_New(c); if(!n->constant){ir_free_node(n);return NULL;}
+        for(Py_ssize_t i=0;i<c;++i){alias_ty a=(alias_ty)asdl_seq_GET(s->v.Import.names,i);PyObject *item=PyTuple_New(2);if(!item){ir_free_node(n);return NULL;}PyTuple_SET_ITEM(item,0,PyUnicode_FromString(a->name));PyTuple_SET_ITEM(item,1,a->asname?PyUnicode_FromString(a->asname):Py_NewRef(Py_None));if(!PyTuple_GET_ITEM(item,0)||!PyTuple_GET_ITEM(item,1)){Py_DECREF(item);ir_free_node(n);return NULL;}PyTuple_SET_ITEM(n->constant,i,item);}return n;}
+    case ImportFrom_kind:{
+        Py_ssize_t c=asdl_seq_LEN(s->v.ImportFrom.names); n=ir_new(PYX_IR_IMPORT_FROM);
+        if(!n)return NULL; n->constant=PyTuple_New(c+2); if(!n->constant){ir_free_node(n);return NULL;}
+        PyObject *module=s->v.ImportFrom.module?PyUnicode_FromString(s->v.ImportFrom.module):Py_NewRef(Py_None);
+        PyTuple_SET_ITEM(n->constant,0,module);PyTuple_SET_ITEM(n->constant,1,PyLong_FromLong(s->v.ImportFrom.level));
+        for(Py_ssize_t i=0;i<c;++i){alias_ty a=(alias_ty)asdl_seq_GET(s->v.ImportFrom.names,i);PyObject *item=PyTuple_New(2);if(!item){ir_free_node(n);return NULL;}PyTuple_SET_ITEM(item,0,PyUnicode_FromString(a->name));PyTuple_SET_ITEM(item,1,a->asname?PyUnicode_FromString(a->asname):Py_NewRef(Py_None));PyTuple_SET_ITEM(n->constant,i+2,item);}return n;}
     default:PyErr_Format(PyExc_NotImplementedError,"PythonX IR: unsupported statement kind %d",(int)s->kind);return NULL;
     }
 }
