@@ -16,6 +16,28 @@ typedef enum { PX_NORMAL=0, PX_BREAK, PX_CONTINUE, PX_RETURN } PXFlow;
 typedef struct { PXFlow flow; int loop_depth; } PXState;
 
 static PyObject *px_eval(const PyXIRNode *, PyObject *, PXState *);
+
+/* Keep native IR execution aware of the host CPU architecture. */
+static const char *px_native_arch(void)
+{
+#if defined(__x86_64__) || defined(_M_X64)
+    return "x86-64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "aarch64";
+#elif defined(__riscv) && (__riscv_xlen == 64)
+    return "riscv64";
+#elif defined(__riscv) && (__riscv_xlen == 32)
+    return "riscv32";
+#elif defined(__arm__) || defined(_M_ARM)
+    return "arm32";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "x86";
+#else
+    return "unknown";
+#endif
+}
+
+
 static PyObject *px_name_load(PyObject *globals, PyObject *name)
 {
     PyObject *value = PyDict_GetItemWithError(globals, name);
@@ -1958,5 +1980,5 @@ PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
 PyObject *_PyX_NativeExecuteIR(PyObject*code){if(!PyCapsule_IsValid(code,"PythonX.native_ir_code")){PyErr_SetString(PyExc_TypeError,"invalid PythonX native IR code");return NULL;}XIRNativeCode*n=PyCapsule_GetPointer(code,"PythonX.native_ir_code");if(!n||!n->code){PyErr_SetString(PyExc_RuntimeError,"empty PythonX native code");return NULL;}return((XIRNativeFunction)n->code)();}
 #else
 PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f){Py_UNUSED(f);PyErr_SetString(PyExc_NotImplementedError,"PythonX native backend has no machine-code emitter for this architecture yet");return NULL;}
-PyObject *_PyX_NativeExecuteIR(PyObject*c){Py_UNUSED(c);PyErr_SetString(PyExc_NotImplementedError,"PythonX native backend has no machine-code emitter for this architecture yet");return NULL;}
+PyObject *_PyX_NativeExecuteIR(PyObject*c){Py_UNUSED(c);PyErr_Format(PyExc_NotImplementedError,"PythonX native backend has no machine-code emitter for architecture %s",px_native_arch());return NULL;}
 #endif
