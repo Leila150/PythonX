@@ -408,6 +408,56 @@ static PyXIRNode *lower_expr(expr_ty e)
     }
 }
 
+static PyXIRNode *lower_class(stmt_ty s)
+{
+    PyXIRNode *n = ir_new(PYX_IR_CLASS);
+    if (!n) return NULL;
+
+    Py_ssize_t nb = asdl_seq_LEN(s->v.ClassDef.bases);
+    Py_ssize_t nk = asdl_seq_LEN(s->v.ClassDef.keywords);
+    Py_ssize_t nd = asdl_seq_LEN(s->v.ClassDef.decorator_list);
+
+    /* name, base count, keyword names, decorator count */
+    PyObject *meta = PyTuple_New(4);
+    PyObject *kw_names = PyTuple_New(nk);
+    if (!meta || !kw_names) {
+        Py_XDECREF(meta); Py_XDECREF(kw_names); ir_free_node(n); return NULL;
+    }
+    PyTuple_SET_ITEM(meta, 0, PyUnicode_FromString(s->v.ClassDef.name));
+    PyTuple_SET_ITEM(meta, 1, PyLong_FromSsize_t(nb));
+    PyTuple_SET_ITEM(meta, 2, kw_names);
+    PyTuple_SET_ITEM(meta, 3, PyLong_FromSsize_t(nd));
+
+    for (Py_ssize_t i = 0; i < nk; ++i) {
+        keyword_ty kw = (keyword_ty)asdl_seq_GET(s->v.ClassDef.keywords, i);
+        if (kw->arg)
+            PyTuple_SET_ITEM(kw_names, i, PyUnicode_FromString(kw->arg));
+        else
+            PyTuple_SET_ITEM(kw_names, i, Py_NewRef(Py_None));
+    }
+
+    n->constant = meta;
+    n->left = lower_suite(s->v.ClassDef.body);
+    if (!n->left) { ir_free_node(n); return NULL; }
+
+    if (set_children(n, nb + nk + nd) < 0) { ir_free_node(n); return NULL; }
+    for (Py_ssize_t i = 0; i < nb; ++i) {
+        n->children[i] = lower_expr((expr_ty)asdl_seq_GET(s->v.ClassDef.bases, i));
+        if (!n->children[i]) { ir_free_node(n); return NULL; }
+    }
+    for (Py_ssize_t i = 0; i < nk; ++i) {
+        keyword_ty kw = (keyword_ty)asdl_seq_GET(s->v.ClassDef.keywords, i);
+        n->children[nb + i] = lower_expr(kw->value);
+        if (!n->children[nb + i]) { ir_free_node(n); return NULL; }
+    }
+    for (Py_ssize_t i = 0; i < nd; ++i) {
+        n->children[nb + nk + i] =
+            lower_expr((expr_ty)asdl_seq_GET(s->v.ClassDef.decorator_list, i));
+        if (!n->children[nb + nk + i]) { ir_free_node(n); return NULL; }
+    }
+    return n;
+}
+
 static PyXIRNode *lower_function(stmt_ty s)
 {
     int is_async = s->kind == AsyncFunctionDef_kind;
@@ -565,6 +615,7 @@ static PyXIRNode *lower_stmt(stmt_ty s)
     switch(s->kind){
     case Expr_kind:return lower_expr(s->v.Expr.value);
     case FunctionDef_kind:return lower_function(s);
+    case ClassDef_kind:return lower_class(s);
     case AsyncFunctionDef_kind:return lower_function(s);
     case If_kind:return lower_if(s);
     case While_kind:return lower_while(s);
