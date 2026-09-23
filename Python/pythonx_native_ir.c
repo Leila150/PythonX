@@ -250,7 +250,7 @@ static PyObject *px_make_dunder_wrapper(const char *name)
 
     PyObject *source = PyUnicode_FromFormat(
         "def %s(self, *args, **kwargs):\n"
-        "    return __pythonx_dispatch__(self, (%s,), args, kwargs)\n",
+        "    return __pythonx_dispatch__(self, \"%s\", args, kwargs)\n",
         name, name);
     if (!source) {
         Py_DECREF(globals);
