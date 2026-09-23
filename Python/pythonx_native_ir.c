@@ -1942,6 +1942,141 @@ PyObject *_PyX_NativeExecuteIR(PyObject*code){
     return((XIRNativeFunction)n->code)();
 }
 
+#elif defined(__riscv) && (__riscv_xlen == 64)
+typedef struct { unsigned char *code; size_t size; PyXIRNode *root; PyObject *globals; } XIRNativeCode;
+typedef PyObject *(*XIRNativeFunction)(void);
+
+static void *alloc_exec(size_t size){
+#if defined(_WIN32)
+    return VirtualAlloc(NULL,size,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+#else
+    void *p=mmap(NULL,size,PROT_READ|PROT_WRITE|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    return p==MAP_FAILED?NULL:p;
+#endif
+}
+static void free_exec(void*p,size_t size){
+#if defined(_WIN32)
+    (void)size;if(p)VirtualFree(p,0,MEM_RELEASE);
+#else
+    if(p)munmap(p,size);
+#endif
+}
+static void capsule_free(PyObject*c){
+    XIRNativeCode*n=PyCapsule_GetPointer(c,"PythonX.native_ir_code");
+    if(!n){PyErr_Clear();return;}
+    free_exec(n->code,n->size);
+    PyXIRFunction f={n->root,n->globals};
+    _PyX_IR_Free(&f);
+    PyMem_RawFree(n);
+}
+
+/* RISC-V64: load absolute pointers from a nearby literal pool. */
+static uint32_t rv_u_type(int rd, int imm20)
+{
+    return ((uint32_t)imm20 << 12) | ((uint32_t)rd << 7) | 0x17u; /* AUIPC */
+}
+static uint32_t rv_i_load(int rd, int rs1, int imm12)
+{
+    return ((uint32_t)(imm12 & 0xFFF) << 20) |
+           ((uint32_t)rs1 << 15) | (3u << 12) |
+           ((uint32_t)rd << 7) | 0x03u; /* LD */
+}
+static uint32_t rv_jalr(int rd, int rs1, int imm12)
+{
+    return ((uint32_t)(imm12 & 0xFFF) << 20) |
+           ((uint32_t)rs1 << 15) | ((uint32_t)rd << 7) | 0x67u;
+}
+
+static void emit_u32(unsigned char *code, size_t *p, uint32_t insn)
+{
+    memcpy(code + *p, &insn, sizeof(insn));
+    *p += sizeof(insn);
+}
+
+static void emit_rv_literal_load(unsigned char *code, size_t *p, int rd,
+                                 uintptr_t value, size_t literal_offset)
+{
+    size_t insn_pc = *p;
+    intptr_t delta = (intptr_t)literal_offset - (intptr_t)insn_pc;
+    int32_t hi20 = (int32_t)((delta + 0x800) >> 12);
+    int32_t lo12 = (int32_t)(delta - ((intptr_t)hi20 << 12));
+    emit_u32(code, p, rv_u_type(rd, hi20 & 0xFFFFF));
+    emit_u32(code, p, rv_i_load(rd, rd, lo12));
+    memcpy(code + literal_offset, &value, sizeof(value));
+}
+
+PyObject *_PyX_NativeCompileIR(const PyXIRFunction*f)
+{
+    if(!f||!f->root){
+        PyErr_SetString(PyExc_TypeError,"PythonX native IR compiler requires a function");
+        return NULL;
+    }
+
+    /*
+     * RISC-V64 ABI: a0 = root, a1 = globals, t0 = callee.
+     * Each pointer is loaded from an 8-byte literal pool entry.
+     */
+    unsigned char code[96];
+    size_t p=0;
+    size_t root_literal=24;
+    size_t globals_literal=32;
+    size_t callee_literal=40;
+
+    PyObject*g=f->globals?Py_NewRef(f->globals):PyDict_New();
+    if(!g)return NULL;
+
+    emit_rv_literal_load(code,&p,10,(uintptr_t)f->root,root_literal);
+    emit_rv_literal_load(code,&p,11,(uintptr_t)g,globals_literal);
+    emit_rv_literal_load(code,&p,5,(uintptr_t)&_PyX_NativeEvaluateIR,callee_literal);
+    emit_u32(code,&p,rv_jalr(1,5,0)); /* jalr ra, t0, 0 */
+    emit_u32(code,&p,0x00008067u);    /* ret: jalr x0, ra, 0 */
+
+    while(p<root_literal) code[p++]=0;
+    memcpy(code+globals_literal, &g, sizeof(g));
+    memcpy(code+callee_literal, &(uintptr_t){(uintptr_t)&_PyX_NativeEvaluateIR}, sizeof(uintptr_t));
+
+    size_t total=callee_literal+sizeof(uintptr_t);
+    void*m=alloc_exec(total);
+    if(!m){
+        Py_DECREF(g);
+        PyErr_SetString(PyExc_MemoryError,"PythonX could not allocate executable memory");
+        return NULL;
+    }
+    memcpy(m,code,total);
+#if defined(_WIN32)
+    FlushInstructionCache(GetCurrentProcess(),m,total);
+#else
+    __builtin___clear_cache((char *)m,(char *)m+total);
+#endif
+
+    XIRNativeCode*n=PyMem_RawMalloc(sizeof(*n));
+    if(!n){
+        free_exec(m,total);
+        Py_DECREF(g);
+        PyErr_NoMemory();
+        return NULL;
+    }
+    n->code=m;n->size=total;n->root=f->root;n->globals=g;
+    ((PyXIRFunction*)f)->root=NULL;((PyXIRFunction*)f)->globals=NULL;
+
+    PyObject*c=PyCapsule_New(n,"PythonX.native_ir_code",capsule_free);
+    if(!c){
+        free_exec(m,total);Py_DECREF(g);PyMem_RawFree(n);
+        return NULL;
+    }
+    return c;
+}
+PyObject *_PyX_NativeExecuteIR(PyObject*code){
+    if(!PyCapsule_IsValid(code,"PythonX.native_ir_code")){
+        PyErr_SetString(PyExc_TypeError,"invalid PythonX.native_ir_code");return NULL;
+    }
+    XIRNativeCode*n=PyCapsule_GetPointer(code,"PythonX.native_ir_code");
+    if(!n||!n->code){
+        PyErr_SetString(PyExc_RuntimeError,"empty PythonX native code");return NULL;
+    }
+    return((XIRNativeFunction)n->code)();
+}
+
 #elif defined(__x86_64__) || defined(_M_X64)
 typedef struct { unsigned char *code; size_t size; PyXIRNode *root; PyObject *globals; } XIRNativeCode;
 typedef PyObject *(*XIRNativeFunction)(void);
