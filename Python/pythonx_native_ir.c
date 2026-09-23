@@ -127,14 +127,24 @@ static PyObject *px_function_descr_get(PyObject *self, PyObject *obj, PyObject *
  */
 static PyObject *px_dunder_wrappers;
 
-static PyObject *px_dunder_dispatch(PyObject *self, PyObject *args, PyObject *kwargs)
+static PyObject *px_dunder_dispatch(PyObject *ignored, PyObject *args, PyObject *kwargs)
 {
-    if (!PyTuple_Check(args)) {
+    Py_UNUSED(ignored);
+    if (!PyTuple_Check(args) || PyTuple_GET_SIZE(args) != 4) {
         PyErr_SetString(PyExc_TypeError, "PythonX dunder dispatcher received invalid arguments");
         return NULL;
     }
 
-    PyObject *name = NULL;
+    PyObject *self = PyTuple_GET_ITEM(args, 0);
+    PyObject *name = PyTuple_GET_ITEM(args, 1);
+    PyObject *forwarded = PyTuple_GET_ITEM(args, 2);
+    PyObject *forwarded_kwargs = PyTuple_GET_ITEM(args, 3);
+    if (!PyUnicode_Check(name) || !PyTuple_Check(forwarded) ||
+        forwarded_kwargs != Py_None && !PyDict_Check(forwarded_kwargs)) {
+        PyErr_SetString(PyExc_TypeError, "PythonX dunder dispatcher received malformed arguments");
+        return NULL;
+    }
+
     PyObject *owner = NULL;
 
     /*
@@ -146,14 +156,7 @@ static PyObject *px_dunder_dispatch(PyObject *self, PyObject *args, PyObject *kw
     else
         owner = Py_NewRef((PyObject *)Py_TYPE(self));
 
-    name = PyObject_Str(PyTuple_GET_ITEM(args, 0));
-    if (!name) {
-        Py_DECREF(owner);
-        return NULL;
-    }
-
     PyObject *hidden = PyUnicode_FromFormat("__pythonx_dunder_%U", name);
-    Py_DECREF(name);
     if (!hidden) {
         Py_DECREF(owner);
         return NULL;
@@ -169,22 +172,18 @@ static PyObject *px_dunder_dispatch(PyObject *self, PyObject *args, PyObject *kw
      * The original PythonX function is a descriptor.  Looking it up on the
      * class above returns the unbound PythonX callable, so prepend self/cls.
      */
-    Py_ssize_t argc = PyTuple_GET_SIZE(args);
-    if (argc < 1) {
-        Py_DECREF(target);
-        PyErr_SetString(PyExc_TypeError, "PythonX dunder wrapper requires a receiver");
-        return NULL;
-    }
-
-    PyObject *call_args = PyTuple_New(argc);
+    Py_ssize_t argc = PyTuple_GET_SIZE(forwarded);
+    PyObject *call_args = PyTuple_New(argc + 1);
     if (!call_args) {
         Py_DECREF(target);
         return NULL;
     }
+    PyTuple_SET_ITEM(call_args, 0, Py_NewRef(self));
     for (Py_ssize_t i = 0; i < argc; ++i)
-        PyTuple_SET_ITEM(call_args, i, Py_NewRef(PyTuple_GET_ITEM(args, i)));
+        PyTuple_SET_ITEM(call_args, i + 1, Py_NewRef(PyTuple_GET_ITEM(forwarded, i)));
 
-    PyObject *result = PyObject_Call(target, call_args, kwargs);
+    PyObject *result = PyObject_Call(target, call_args,
+                                     forwarded_kwargs == Py_None ? NULL : forwarded_kwargs);
     Py_DECREF(call_args);
     Py_DECREF(target);
     return result;
@@ -449,6 +448,18 @@ static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
     PyObject *body_result = px_eval(n->left, namespace, s);
     if (!body_result) { Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
     Py_DECREF(body_result);
+
+    /*
+     * Bridge PythonX-defined dunder methods to real CPython function objects
+     * before type() inspects the namespace.  This is what makes implicit
+     * operators, len(), iteration, item access, context management, hashing,
+     * async protocols, and the other data-model operations reach PythonX code.
+     */
+    if (px_bridge_dunder_namespace(namespace) < 0) {
+        Py_DECREF(bases);
+        Py_DECREF(namespace);
+        return NULL;
+    }
 
     PyObject *kwargs = PyDict_New();
     if (!kwargs) { Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
