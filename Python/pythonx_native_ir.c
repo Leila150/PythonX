@@ -2,6 +2,7 @@
 #include "pythonx_ir.h"
 #include "pythonx_native_ir.h"
 #include "pythonx_error_statements.h"
+#include <structmember.h>
 #include <stdint.h>
 #include <string.h>
 #if defined(_WIN32)
@@ -1203,6 +1204,7 @@ PyObject *_PyX_NativeEvaluateIR(const PyXIRNode*n,PyObject*g)
     if(!n||!g||!PyDict_Check(g)){PyErr_SetString(PyExc_TypeError,"invalid PythonX native IR state");return NULL;}
     PXState s={PX_NORMAL};PyObject*r=px_eval(n,g,&s);if(!r)return NULL;
     if(s.flow==PX_BREAK||s.flow==PX_CONTINUE){Py_DECREF(r);PyErr_SetString(PyExc_SyntaxError,"break/continue outside loop");return NULL;}
+    if(s.flow==PX_RETURN){Py_DECREF(r);PyErr_SetString(PyExc_SyntaxError,"'return' outside function");return NULL;}
     return r;
 }
 
