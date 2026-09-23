@@ -2145,7 +2145,10 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         (expr->op == PYX_IR_ADD || expr->op == PYX_IR_SUB ||
          expr->op == PYX_IR_MUL || expr->op == PYX_IR_BITOR ||
          expr->op == PYX_IR_BITXOR || expr->op == PYX_IR_BITAND ||
-         expr->op == PYX_IR_LSHIFT || expr->op == PYX_IR_RSHIFT) &&
+         expr->op == PYX_IR_LSHIFT || expr->op == PYX_IR_RSHIFT ||
+         expr->op == PYX_IR_LT || expr->op == PYX_IR_LE ||
+         expr->op == PYX_IR_EQ || expr->op == PYX_IR_NE ||
+         expr->op == PYX_IR_GT || expr->op == PYX_IR_GE) &&
         expr->left->op == PYX_IR_CONST && expr->right->op == PYX_IR_CONST &&
         px_native_int64(expr->left->constant, &a) &&
         px_native_int64(expr->right->constant, &b)) {
@@ -2154,6 +2157,11 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
          * the exact Python result fits in int64_t; otherwise fall back to
          * the normal evaluator instead of silently wrapping.
          */
+        if (expr->op == PYX_IR_LT || expr->op == PYX_IR_LE ||
+            expr->op == PYX_IR_EQ || expr->op == PYX_IR_NE ||
+            expr->op == PYX_IR_GT || expr->op == PYX_IR_GE)
+            goto emit_compare;
+
         PyObject *va = PyLong_FromLongLong(a);
         PyObject *vb = PyLong_FromLongLong(b);
         PyObject *vres = NULL;
@@ -2249,6 +2257,40 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
     }
     return NULL;
 
+emit_compare:
+#if defined(_WIN32)
+        code[p++]=0x48; code[p++]=0xB8;
+        memcpy(code+p,&a,8); p+=8;
+        code[p++]=0x49; code[p++]=0xB8;
+        memcpy(code+p,&b,8); p+=8;
+#else
+        code[p++]=0x48; code[p++]=0xB8;
+        memcpy(code+p,&a,8); p+=8;
+        code[p++]=0x49; code[p++]=0xB8;
+        memcpy(code+p,&b,8); p+=8;
+#endif
+        code[p++]=0x49; code[p++]=0x39; code[p++]=0xC0; /* cmp rax, r8 */
+        if (expr->op == PYX_IR_LT) {
+            code[p++]=0x0F; code[p++]=0x9C; code[p++]=0xC0; /* setl al */
+        } else if (expr->op == PYX_IR_LE) {
+            code[p++]=0x0F; code[p++]=0x9E; code[p++]=0xC0; /* setle al */
+        } else if (expr->op == PYX_IR_EQ) {
+            code[p++]=0x0F; code[p++]=0x94; code[p++]=0xC0; /* sete al */
+        } else if (expr->op == PYX_IR_NE) {
+            code[p++]=0x0F; code[p++]=0x95; code[p++]=0xC0; /* setne al */
+        } else if (expr->op == PYX_IR_GT) {
+            code[p++]=0x0F; code[p++]=0x9F; code[p++]=0xC0; /* setg al */
+        } else {
+            code[p++]=0x0F; code[p++]=0x9D; code[p++]=0xC0; /* setge al */
+        }
+        code[p++]=0x0F; code[p++]=0xB6; code[p++]=0xC0; /* movzx eax, al */
+#if defined(_WIN32)
+        code[p++]=0x48; code[p++]=0x89; code[p++]=0xC1; /* mov rcx, rax */
+#else
+        code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7; /* mov rdi, rax */
+#endif
+        goto emit_bool_call;
+
 emit_value:
 #if defined(_WIN32)
     code[p++]=0x48; code[p++]=0xB9;
@@ -2256,6 +2298,25 @@ emit_value:
     code[p++]=0x48; code[p++]=0xBF;
 #endif
     memcpy(code+p,&a,8); p+=8;
+
+emit_bool_call:
+#if defined(_WIN32)
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xEC; code[p++]=0x28;
+#else
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xEC; code[p++]=0x08;
+#endif
+    code[p++]=0x48; code[p++]=0xB8;
+    {
+        uint64_t fn=(uint64_t)(uintptr_t)&PyBool_FromLong;
+        memcpy(code+p,&fn,8); p+=8;
+    }
+    code[p++]=0xFF; code[p++]=0xD0;
+#if defined(_WIN32)
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x28;
+#else
+    code[p++]=0x48; code[p++]=0x83; code[p++]=0xC4; code[p++]=0x08;
+#endif
+    code[p++]=0xC3;
 
 emit_call:
 #if defined(_WIN32)
