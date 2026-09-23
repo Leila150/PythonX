@@ -2174,8 +2174,6 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             vres = PyNumber_Multiply(va, vb);
         else if (expr->op == PYX_IR_LSHIFT)
             vres = PyNumber_Lshift(va, vb);
-        else if (expr->op == PYX_IR_LSHIFT)
-            vres = PyNumber_Lshift(va, vb);
         else if (expr->op == PYX_IR_RSHIFT)
             vres = PyNumber_Rshift(va, vb);
         else if (expr->op == PYX_IR_BITOR)
