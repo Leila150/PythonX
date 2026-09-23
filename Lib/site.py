@@ -688,13 +688,27 @@ def execusercustomize():
 
 
 def addpythonxpackages(known_paths):
-    """Add packages installed by PythonX pipx to the PythonX environment."""
+    """Add packages installed by PythonX pipx to the active PythonX environment."""
+    paths = []
+
+    # pipx can explicitly identify the live PythonX package directory.
+    configured = os.environ.get("PYTHONX_SITE_PACKAGES")
+    if configured:
+        paths.append(os.path.expanduser(configured))
+
+    # Keep the per-user PythonX environment as a compatibility/fallback path.
     root = os.environ.get("PYTHONX_HOME")
     if root:
-        package_dir = os.path.join(os.path.expanduser(root), "site-packages")
+        paths.append(os.path.join(os.path.expanduser(root), "site-packages"))
     else:
-        package_dir = os.path.join(os.path.expanduser("~"), ".pythonx", "site-packages")
-    return addsitedir(package_dir, known_paths)
+        paths.append(os.path.join(os.path.expanduser("~"), ".pythonx", "site-packages"))
+
+    # A normal PythonX installation already discovers sys.prefix's
+    # site-packages through addsitepackages(), so don't duplicate it.
+    for package_dir in paths:
+        if os.path.isdir(package_dir):
+            known_paths = addsitedir(package_dir, known_paths)
+    return known_paths
 
 
 def main():
