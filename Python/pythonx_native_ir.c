@@ -459,6 +459,16 @@ static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
                              PyDict_GetItemString(g, "__name__") : Py_None) < 0) {
         Py_DECREF(bases); Py_DECREF(namespace); return NULL;
     }
+    /*
+     * Hidden execution metadata is deliberately kept out of the normal
+     * Python-facing class API.  __pythonx_globals__ provides module-global
+     * lookup for names used while executing the class body; the class marker
+     * prevents methods from incorrectly capturing class attributes.
+     */
+    if (PyDict_SetItemString(namespace, "__pythonx_globals__", g) < 0 ||
+        PyDict_SetItemString(namespace, "__pythonx_class_namespace__", Py_True) < 0) {
+        Py_DECREF(bases); Py_DECREF(namespace); return NULL;
+    }
     PyObject *body_result = px_eval(n->left, namespace, s);
     if (!body_result) { Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
     Py_DECREF(body_result);
@@ -511,7 +521,17 @@ static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
     Py_DECREF(namespace);
     if (!class_obj) return NULL;
 
-    for (Py_ssize_t i = 0; i < nd; ++i) {
+    /*
+     * Class decorators are applied from the innermost decorator to the
+     * outermost decorator, matching Python:
+     *
+     *     @outer
+     *     @inner
+     *     class C: ...
+     *
+     * becomes outer(inner(C)).
+     */
+    for (Py_ssize_t i = nd - 1; i >= 0; --i) {
         PyObject *decorator = px_eval(n->children[nb + nk + i], g, s);
         if (!decorator) { Py_DECREF(class_obj); return NULL; }
         PyObject *next = PyObject_CallOneArg(decorator, class_obj);
@@ -817,10 +837,25 @@ static PyObject *px_function(const PyXIRNode *n, PyObject *g, PXState *s)
     int is_async = meta_size > 10 && PyObject_IsTrue(PyTuple_GET_ITEM(meta, 10));
     if (PyErr_Occurred()) goto fail;
 
+    /*
+     * A class suite needs its own namespace for class attributes and methods,
+     * but methods do not close over the class namespace.  Marking the class
+     * namespace lets us evaluate defaults/decorators there while making the
+     * resulting method resolve globals from the defining module.
+     */
+    int class_namespace = g && PyDict_Check(g) &&
+        PyDict_GetItemString(g, "__pythonx_class_namespace__") != NULL;
+    PyObject *function_globals = g;
+    if (class_namespace) {
+        PyObject *real_globals = PyDict_GetItemString(g, "__pythonx_globals__");
+        if (real_globals && PyDict_Check(real_globals))
+            function_globals = real_globals;
+    }
+
     PyXFunctionObject *fn = (PyXFunctionObject *)PyObject_New(PyXFunctionObject, &PyXFunction_Type);
     if (!fn) goto fail;
     fn->node = n;
-    fn->globals = Py_NewRef(g);
+    fn->globals = Py_NewRef(function_globals);
     fn->defaults = defaults; defaults = NULL;
     fn->kwdefaults = kwdefaults; kwdefaults = NULL;
     fn->annotations = annotations; annotations = NULL;
@@ -831,7 +866,9 @@ static PyObject *px_function(const PyXIRNode *n, PyObject *g, PXState *s)
         fn->module = m ? Py_NewRef(m) : Py_NewRef(Py_None);
     } else fn->module = Py_NewRef(module);
     fn->doc = Py_NewRef(doc);
-    fn->parent = (g && PyDict_Check(g) && PyDict_GetItemString(g, "__pythonx_globals__")) ? Py_NewRef(g) : NULL;
+    fn->parent = (class_namespace || !function_globals) ? NULL :
+        ((g && PyDict_Check(g) && PyDict_GetItemString(g, "__pythonx_globals__"))
+            ? Py_NewRef(g) : NULL);
     fn->is_async = is_async;
 
     /*
