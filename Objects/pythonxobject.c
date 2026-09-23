@@ -1,7 +1,6 @@
 #include "Python.h"
 #include "pycore_pythonxobject.h"
 
-#include <structmember.h>
 
 static int
 pythonx_object_traverse(PyXObject *self, visitproc visit, void *arg)
@@ -35,12 +34,6 @@ pythonx_object_repr(PyObject *self)
                                type->tp_name, self);
 }
 
-static PyMemberDef pythonx_object_members[] = {
-    {"__dict__", T_OBJECT, offsetof(PyXObject, dict), READONLY,
-     "PythonX instance attribute dictionary."},
-    {NULL}
-};
-
 PyTypeObject PyXObject_Type = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "pythonx.object",
@@ -54,7 +47,6 @@ PyTypeObject PyXObject_Type = {
     .tp_doc = "PythonX root object type.",
     .tp_traverse = (traverseproc)pythonx_object_traverse,
     .tp_clear = (inquiry)pythonx_object_clear,
-    .tp_members = pythonx_object_members,
     .tp_getattro = PyObject_GenericGetAttr,
     .tp_setattro = PyObject_GenericSetAttr,
     .tp_dictoffset = offsetof(PyXObject, dict),
