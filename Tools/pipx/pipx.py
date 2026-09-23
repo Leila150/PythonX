@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import shutil
+import sysconfig
 import subprocess
 import sys
 import tarfile
@@ -48,12 +49,36 @@ def home() -> Path:
     return Path(os.environ.get("PYTHONX_HOME", DEFAULT_HOME)).expanduser().resolve()
 
 
+def pythonx_prefix() -> Path:
+    """Return the PythonX environment that pipx is installing into."""
+    configured = os.environ.get("PYTHONX_PREFIX")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(sys.prefix).resolve()
+
+
 def packages_dir() -> Path:
-    return home() / "site-packages"
+    """Return the live site-packages directory used by this PythonX."""
+    configured = os.environ.get("PYTHONX_SITE_PACKAGES")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    try:
+        purelib = sysconfig.get_path("purelib")
+    except Exception:
+        purelib = None
+    if purelib:
+        return Path(purelib).resolve()
+    return pythonx_prefix() / "Lib" / "site-packages"
+
+
+def data_home() -> Path:
+    return home()
+
+
 
 
 def metadata_dir() -> Path:
-    return home() / "metadata"
+    return data_home() / "metadata"
 
 
 def installed_path(name: str) -> Path:
@@ -225,6 +250,7 @@ def package_metadata(name: str, version: str, os_build: bool, **extra: Any) -> d
         "name": name,
         "version": version,
         "pythonx": True,
+        "environment": str(pythonx_prefix()),
         "os_build": os_build,
         "installed_by": "pipx",
         **extra,
@@ -450,7 +476,7 @@ def install_package(name: str, requested_version: str | None, os_build: bool, in
                     continue
             install_package(dep_name, None, os_build, indexes_list, False, seen)
 
-    print(f"pipx: installed {canonical} into {target}")
+    print(f"pipx: installed {canonical} into PythonX environment: {target}")
     if os_build:
         print("pipx: marked for PythonX OS build.")
 
