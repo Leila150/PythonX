@@ -2128,7 +2128,7 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
     }
 
     if (expr->op == PYX_IR_NEGATIVE || expr->op == PYX_IR_POSITIVE ||
-        expr->op == PYX_IR_INVERT) {
+        expr->op == PYX_IR_INVERT || expr->op == PYX_IR_NOT) {
         if (!expr->left || expr->left->op != PYX_IR_CONST ||
             !px_native_int64(expr->left->constant, &a))
             return NULL;
@@ -2138,6 +2138,10 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             a = -a;
         else if (expr->op == PYX_IR_INVERT)
             a = ~a;
+        else if (expr->op == PYX_IR_NOT) {
+            a = !a;
+            goto emit_bool_value;
+        }
         goto emit_value;
     }
 
@@ -2367,6 +2371,15 @@ emit_compare:
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7; /* mov rdi, rax */
 #endif
         goto emit_bool_call;
+
+emit_bool_value:
+#if defined(_WIN32)
+    code[p++]=0x48; code[p++]=0xB9;
+#else
+    code[p++]=0x48; code[p++]=0xBF;
+#endif
+    memcpy(code+p,&a,8); p+=8;
+    goto emit_bool_call;
 
 emit_value:
 #if defined(_WIN32)
