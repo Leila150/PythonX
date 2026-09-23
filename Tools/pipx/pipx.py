@@ -543,12 +543,19 @@ def uninstall(name: str) -> None:
 
 def edit_package(name: str) -> None:
     meta = load_metadata(name)
-    target = installed_path(meta["name"])
+    target = packages_dir()
+    files = [
+        target / relative
+        for relative in meta.get("installed_files", [])
+        if (target / relative).is_file()
+    ]
+    if not files:
+        raise RuntimeError(f"PythonX pipx: package {name!r} has no editable files.")
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
     if not editor:
         editor = "notepad" if os.name == "nt" else "nano"
     try:
-        subprocess.run([editor, str(target)], check=False)
+        subprocess.run([editor, str(files[0])], check=False)
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"PythonX pipx: editor {editor!r} was not found. "
@@ -589,11 +596,26 @@ def verify_package(name: str) -> None:
 
 
 def clear_packages() -> None:
-    if packages_dir().exists():
-        shutil.rmtree(packages_dir())
-    if metadata_dir().exists():
-        shutil.rmtree(metadata_dir())
-    print("pipx: cleared the PythonX third-party package environment.")
+    target = packages_dir()
+    names = installed_names()
+    removed = 0
+    for name in names:
+        meta = load_metadata(name)
+        for relative in meta.get("installed_files", []):
+            path = target / relative
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                removed += 1
+        for relative in sorted(meta.get("installed_files", []), reverse=True):
+            parent = (target / relative).parent
+            while parent != target and parent.exists():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        metadata_path(meta["name"]).unlink(missing_ok=True)
+    print(f"pipx: cleared {len(names)} packages ({removed} files) from PythonX.")
 
 
 def main(argv: list[str] | None = None) -> int:
