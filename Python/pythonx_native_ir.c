@@ -20,7 +20,26 @@ static PyObject *px_name_load(PyObject *globals, PyObject *name)
     if (value) return Py_NewRef(value);
     if (PyErr_Occurred()) return NULL;
 
-    PyObject *builtins = PyEval_GetBuiltins();
+    /*
+     * Resolve built-ins from the execution globals first.  A Python module
+     * normally carries __builtins__ as either the builtins module or its
+     * dictionary.  Using it here keeps PythonX's native IR execution tied to
+     * the same built-in namespace as the source globals instead of depending
+     * on whichever frame happens to be active around the native trampoline.
+     */
+    PyObject *builtins = PyDict_GetItemString(globals, "__builtins__");
+    if (builtins && PyModule_Check(builtins)) {
+        builtins = PyModule_GetDict(builtins);
+    }
+    if (builtins && PyDict_Check(builtins)) {
+        value = PyDict_GetItemWithError(builtins, name);
+        if (value) return Py_NewRef(value);
+        if (PyErr_Occurred()) return NULL;
+    }
+
+    /* Fall back to the interpreter's active built-in namespace for callers
+       that construct a globals dictionary without __builtins__. */
+    builtins = PyEval_GetBuiltins();
     if (builtins && PyDict_Check(builtins)) {
         value = PyDict_GetItemWithError(builtins, name);
         if (value) return Py_NewRef(value);
