@@ -82,6 +82,7 @@ typedef struct {
     PyObject *module;
     PyObject *doc;
     PyObject *parent;
+    PyObject *owner;
     int is_async;
 } PyXFunctionObject;
 
@@ -100,6 +101,7 @@ static void px_function_dealloc(PyXFunctionObject *fn)
     Py_XDECREF(fn->module);
     Py_XDECREF(fn->doc);
     Py_XDECREF(fn->parent);
+    Py_XDECREF(fn->owner);
     Py_TYPE(fn)->tp_free((PyObject *)fn);
 }
 
@@ -504,22 +506,50 @@ static PyObject *px_class(const PyXIRNode *n, PyObject *g, PXState *s)
     }
 
     PyObject *type_obj = (PyObject *)&PyType_Type;
-    PyObject *class_obj = PyObject_CallFunctionObjArgs(type_obj, name, bases, namespace, NULL);
-    if (!class_obj && PyDict_GetItemString(kwargs, "metaclass")) {
-        /*
-         * A metaclass needs the full three-argument class construction path
-         * with keywords.  Rebuild the call using type(*args, **kwargs).
-         */
-        PyErr_Clear();
-        PyObject *args = PyTuple_Pack(3, name, bases, namespace);
-        if (!args) { Py_DECREF(kwargs); Py_DECREF(bases); Py_DECREF(namespace); return NULL; }
-        class_obj = PyObject_Call(type_obj, args, kwargs);
-        Py_DECREF(args);
+    PyObject *class_args = PyTuple_Pack(3, name, bases, namespace);
+    if (!class_args) {
+        Py_DECREF(kwargs); Py_DECREF(bases); Py_DECREF(namespace); return NULL;
     }
+    /*
+     * Always pass class-definition keywords through the type constructor.
+     * This is required for metaclasses and for __init_subclass__(**kwargs).
+     */
+    PyObject *class_obj = PyObject_Call(type_obj, class_args, kwargs);
+    Py_DECREF(class_args);
     Py_DECREF(kwargs);
     Py_DECREF(bases);
     Py_DECREF(namespace);
     if (!class_obj) return NULL;
+
+    /*
+     * Record the class that defined each PythonX method.  We do this after
+     * type() creates the class because the class object did not exist while
+     * the class suite was executing.
+     */
+    PyObject *dict_keys = PyDict_Keys(namespace);
+    if (!dict_keys) { Py_DECREF(class_obj); return NULL; }
+    Py_ssize_t method_count = PyList_GET_SIZE(dict_keys);
+    for (Py_ssize_t i = 0; i < method_count; ++i) {
+        PyObject *key = PyList_GET_ITEM(dict_keys, i);
+        PyObject *value = PyDict_GetItemWithError(namespace, key);
+        if (!value) continue;
+        if (PyObject_TypeCheck(value, &PyXFunction_Type)) {
+            PyXFunctionObject *fn = (PyXFunctionObject *)value;
+            Py_XSETREF(fn->owner, Py_NewRef(class_obj));
+        }
+        /* Dunder bridge keeps the original PythonX function under this name. */
+        if (PyUnicode_Check(key)) {
+            PyObject *hidden = PyUnicode_FromFormat("__pythonx_dunder_%U", key);
+            if (!hidden) { Py_DECREF(dict_keys); Py_DECREF(class_obj); return NULL; }
+            PyObject *original = PyDict_GetItemWithError(namespace, hidden);
+            if (original && PyObject_TypeCheck(original, &PyXFunction_Type)) {
+                PyXFunctionObject *fn = (PyXFunctionObject *)original;
+                Py_XSETREF(fn->owner, Py_NewRef(class_obj));
+            }
+            Py_DECREF(hidden);
+        }
+    }
+    Py_DECREF(dict_keys);
 
     /*
      * Class decorators are applied from the innermost decorator to the
@@ -588,6 +618,15 @@ static PyObject *px_function_call(PyObject *self, PyObject *args, PyObject *kwar
     PyObject *locals = PyDict_New();
     if (!locals) goto error_no_locals;
     if (PyDict_SetItemString(locals, "__pythonx_globals__", fn->globals) < 0) goto error;
+    /*
+     * Keep the bound receiver and defining class available to the PythonX
+     * evaluator.  This is used for class-aware operations such as super().
+     */
+    if (PyDict_SetItemString(locals, "__pythonx_self__", Py_None) < 0)
+        goto error;
+    if (fn->owner &&
+        PyDict_SetItemString(locals, "__pythonx_class__", fn->owner) < 0)
+        goto error;
     
     /* Nested PythonX functions can read names from their defining scope. */
     if (fn->parent) {
@@ -596,6 +635,9 @@ static PyObject *px_function_call(PyObject *self, PyObject *args, PyObject *kwar
     }
 
     /* Positional-only and normal positional parameters. */
+    if (total_pos > 0 && arg_count > 0 &&
+        PyDict_SetItemString(locals, "__pythonx_self__", PyTuple_GET_ITEM(args, 0)) < 0)
+        goto error;
     for (Py_ssize_t i = 0; i < total_pos; ++i) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
         PyObject *value = NULL;
@@ -869,6 +911,7 @@ static PyObject *px_function(const PyXIRNode *n, PyObject *g, PXState *s)
     fn->parent = (class_namespace || !function_globals) ? NULL :
         ((g && PyDict_Check(g) && PyDict_GetItemString(g, "__pythonx_globals__"))
             ? Py_NewRef(g) : NULL);
+    fn->owner = NULL;
     fn->is_async = is_async;
 
     /*
@@ -925,6 +968,26 @@ static PyObject *px_call(const PyXIRNode *n, PyObject *g, PXState *s)
 {
     PyObject *callable = px_eval(n->children[0], g, s);
     if (!callable) return NULL;
+
+    /*
+     * Python's zero-argument super() normally gets __class__ and self from
+     * the executing frame. PythonX uses an explicit evaluator namespace, so
+     * provide the same information here when super() has no arguments.
+     */
+    if (callable == (PyObject *)&PySuper_Type && n->child_count == 1) {
+        PyObject *self_obj = PyDict_GetItemString(g, "__pythonx_self__");
+        PyObject *class_obj = PyDict_GetItemString(g, "__pythonx_class__");
+        if (!self_obj || self_obj == Py_None || !class_obj) {
+            Py_DECREF(callable);
+            PyErr_SetString(PyExc_RuntimeError,
+                            "super(): no current PythonX class context");
+            return NULL;
+        }
+        PyObject *result = PyObject_CallFunctionObjArgs(
+            callable, class_obj, self_obj, NULL);
+        Py_DECREF(callable);
+        return result;
+    }
     PyObject *args = PyList_New(0), *kwargs = PyDict_New();
     if (!args || !kwargs) { Py_XDECREF(args); Py_XDECREF(kwargs); Py_DECREF(callable); return NULL; }
     for (Py_ssize_t i = 0; i < n->child_count - 1; ++i) {
