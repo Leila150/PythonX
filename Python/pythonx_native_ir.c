@@ -2127,7 +2127,8 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
         goto emit_value;
     }
 
-    if (expr->op == PYX_IR_UNARY_MINUS || expr->op == PYX_IR_UNARY_PLUS) {
+    if (expr->op == PYX_IR_UNARY_MINUS || expr->op == PYX_IR_UNARY_PLUS ||
+        expr->op == PYX_IR_INVERT) {
         if (!expr->left || expr->left->op != PYX_IR_CONST ||
             !px_native_int64(expr->left->constant, &a))
             return NULL;
@@ -2135,12 +2136,15 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             return NULL;
         if (expr->op == PYX_IR_UNARY_MINUS)
             a = -a;
+        else if (expr->op == PYX_IR_INVERT)
+            a = ~a;
         goto emit_value;
     }
 
     if (expr->left && expr->right &&
         (expr->op == PYX_IR_ADD || expr->op == PYX_IR_SUB ||
-         expr->op == PYX_IR_MUL) &&
+         expr->op == PYX_IR_MUL || expr->op == PYX_IR_BITOR ||
+         expr->op == PYX_IR_BITXOR || expr->op == PYX_IR_BITAND) &&
         expr->left->op == PYX_IR_CONST && expr->right->op == PYX_IR_CONST &&
         px_native_int64(expr->left->constant, &a) &&
         px_native_int64(expr->right->constant, &b)) {
@@ -2184,8 +2188,14 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             code[p++]=0x4C; code[p++]=0x01; code[p++]=0xC0; /* add rax, r8 */
         } else if (expr->op == PYX_IR_SUB) {
             code[p++]=0x4C; code[p++]=0x29; code[p++]=0xC0; /* sub rax, r8 */
-        } else {
+        } else if (expr->op == PYX_IR_MUL) {
             code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax, r8 */
+        } else if (expr->op == PYX_IR_BITOR) {
+            code[p++]=0x4C; code[p++]=0x09; code[p++]=0xC0; /* or rax, r8 */
+        } else if (expr->op == PYX_IR_BITXOR) {
+            code[p++]=0x4C; code[p++]=0x31; code[p++]=0xC0; /* xor rax, r8 */
+        } else {
+            code[p++]=0x4C; code[p++]=0x21; code[p++]=0xC0; /* and rax, r8 */
         }
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC1; /* mov rcx, rax */
 #else
@@ -2198,8 +2208,14 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
             code[p++]=0x4C; code[p++]=0x01; code[p++]=0xC0; /* add rax, r8 */
         } else if (expr->op == PYX_IR_SUB) {
             code[p++]=0x4C; code[p++]=0x29; code[p++]=0xC0; /* sub rax, r8 */
-        } else {
+        } else if (expr->op == PYX_IR_MUL) {
             code[p++]=0x49; code[p++]=0x0F; code[p++]=0xAF; code[p++]=0xC0; /* imul rax, r8 */
+        } else if (expr->op == PYX_IR_BITOR) {
+            code[p++]=0x4C; code[p++]=0x09; code[p++]=0xC0; /* or rax, r8 */
+        } else if (expr->op == PYX_IR_BITXOR) {
+            code[p++]=0x4C; code[p++]=0x31; code[p++]=0xC0; /* xor rax, r8 */
+        } else {
+            code[p++]=0x4C; code[p++]=0x21; code[p++]=0xC0; /* and rax, r8 */
         }
         code[p++]=0x48; code[p++]=0x89; code[p++]=0xC7; /* mov rdi, rax */
 #endif
