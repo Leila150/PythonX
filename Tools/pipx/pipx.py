@@ -46,7 +46,7 @@ def home() -> Path:
 
 
 def packages_dir() -> Path:
-    return home() / "packages"
+    return home() / "site-packages"
 
 
 def metadata_dir() -> Path:
@@ -228,7 +228,7 @@ def package_metadata(name: str, version: str, os_build: bool) -> dict[str, Any]:
     }
 
 
-def check_os_compatibility(info: dict[str, Any], filename: str) -> None:
+def check_os_compatibility(info: dict[str, Any], filename: str, wheel_metadata: dict[str, str] | None = None) -> None:
     """
     Conservative pre-install check.
 
