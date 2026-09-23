@@ -20,12 +20,30 @@ static PyObject *px_name_load(PyObject *globals, PyObject *name)
     if (value) return Py_NewRef(value);
     if (PyErr_Occurred()) return NULL;
 
+    /* Function-local name resolution: locals -> defining scopes -> globals. */
+    PyObject *parent = PyDict_GetItemString(globals, "__pythonx_parent__");
+    if (parent && PyDict_Check(parent)) {
+        value = PyDict_GetItemWithError(parent, name);
+        if (value) return Py_NewRef(value);
+        if (PyErr_Occurred()) return NULL;
+        PyObject *result = px_name_load(parent, name);
+        if (result) return result;
+        if (!PyErr_ExceptionMatches(PyExc_NameError)) return NULL;
+        PyErr_Clear();
+    }
+
+    PyObject *real_globals = PyDict_GetItemString(globals, "__pythonx_globals__");
+    if (real_globals && PyDict_Check(real_globals) && real_globals != globals) {
+        value = PyDict_GetItemWithError(real_globals, name);
+        if (value) return Py_NewRef(value);
+        if (PyErr_Occurred()) return NULL;
+        globals = real_globals;
+    }
+
     /*
      * Resolve built-ins from the execution globals first.  A Python module
      * normally carries __builtins__ as either the builtins module or its
-     * dictionary.  Using it here keeps PythonX's native IR execution tied to
-     * the same built-in namespace as the source globals instead of depending
-     * on whichever frame happens to be active around the native trampoline.
+     * dictionary.
      */
     PyObject *builtins = PyDict_GetItemString(globals, "__builtins__");
     if (builtins && PyModule_Check(builtins)) {
@@ -51,29 +69,40 @@ static PyObject *px_name_load(PyObject *globals, PyObject *name)
 }
 
 typedef struct {
+    PyObject_HEAD
     const PyXIRNode *node;
     PyObject *globals;
     PyObject *defaults;
     PyObject *kwdefaults;
-} PXLambdaClosure;
+    PyObject *annotations;
+    PyObject *name;
+    PyObject *qualname;
+    PyObject *module;
+    PyObject *doc;
+    int is_async;
+} PyXFunctionObject;
 
-static void px_lambda_free(PyObject *capsule)
+static PyTypeObject PyXFunction_Type;
+
+static PyObject *px_name_load(PyObject *locals, PyObject *name);
+
+static void px_function_dealloc(PyXFunctionObject *fn)
 {
-    PXLambdaClosure *c = PyCapsule_GetPointer(capsule, "PythonX.lambda");
-    if (!c) { PyErr_Clear(); return; }
-    Py_XDECREF(c->globals);
-    Py_XDECREF(c->defaults);
-    Py_XDECREF(c->kwdefaults);
-    PyMem_Free(c);
+    Py_XDECREF(fn->globals);
+    Py_XDECREF(fn->defaults);
+    Py_XDECREF(fn->kwdefaults);
+    Py_XDECREF(fn->annotations);
+    Py_XDECREF(fn->name);
+    Py_XDECREF(fn->qualname);
+    Py_XDECREF(fn->module);
+    Py_XDECREF(fn->doc);
+    Py_TYPE(fn)->tp_free((PyObject *)fn);
 }
 
-static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs)
+static PyObject *px_function_call(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-    PyObject *capsule = PyCFunction_GET_SELF(self);
-    PXLambdaClosure *c = PyCapsule_GetPointer(capsule, "PythonX.lambda");
-    if (!c) return NULL;
-
-    const PyXIRNode *n = c->node;
+    PyXFunctionObject *fn = (PyXFunctionObject *)self;
+    const PyXIRNode *n = fn->node;
     PyObject *meta = n->constant;
     Py_ssize_t posonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 0));
     Py_ssize_t positional = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 1));
@@ -106,8 +135,27 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         goto error_no_locals;
     }
 
-    PyObject *locals = PyDict_Copy(c->globals);
+    /*
+     * A PythonX function gets a real local namespace.  Globals are resolved
+     * lazily through the hidden globals/parent links rather than by copying
+     * the entire globals dictionary into locals.  This is what makes
+     * assignments inside a function local by default.
+     */
+    PyObject *locals = PyDict_New();
     if (!locals) goto error_no_locals;
+    if (PyDict_SetItemString(locals, "__pythonx_globals__", fn->globals) < 0) goto error;
+    
+    /* Nested PythonX functions can read names from their defining scope. */
+    PyObject *parent = PyObject_GetAttrString(self, "__pythonx_parent__");
+    if (parent) {
+        if (PyDict_SetItemString(locals, "__pythonx_parent__", parent) < 0) {
+            Py_DECREF(parent);
+            goto error;
+        }
+        Py_DECREF(parent);
+    } else {
+        PyErr_Clear();
+    }
 
     /* Positional-only and normal positional parameters. */
     for (Py_ssize_t i = 0; i < total_pos; ++i) {
@@ -139,9 +187,9 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         }
 
         if (!value) {
-            Py_ssize_t default_count = PyTuple_GET_SIZE(c->defaults);
+            Py_ssize_t default_count = PyTuple_GET_SIZE(fn->defaults);
             Py_ssize_t default_index = i - (total_pos - default_count);
-            if (default_index >= 0) value = PyTuple_GET_ITEM(c->defaults, default_index);
+            if (default_index >= 0) value = PyTuple_GET_ITEM(fn->defaults, default_index);
         }
 
         if (!value) {
@@ -152,7 +200,6 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         if (PyDict_SetItem(locals, name, value) < 0) goto error;
     }
 
-    /* *args receives every extra positional argument as a tuple. */
     if (vararg_name != Py_None) {
         PyObject *extra = PyTuple_GetSlice(args, total_pos, arg_count);
         if (!extra) goto error;
@@ -163,14 +210,14 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
         Py_DECREF(extra);
     }
 
-    /* Keyword-only parameters, including their defaults. */
+    /* Keyword-only parameters, including defaults. */
     for (Py_ssize_t i = total_pos; i < total_pos + kwonly; ++i) {
         PyObject *name = PyTuple_GET_ITEM(names, i);
         PyObject *value = kwargs ? PyDict_GetItemWithError(kwargs, name) : NULL;
         if (!value && kwargs && PyErr_Occurred()) goto error;
 
-        if (!value && c->kwdefaults)
-            value = PyDict_GetItemWithError(c->kwdefaults, name);
+        if (!value && fn->kwdefaults)
+            value = PyDict_GetItemWithError(fn->kwdefaults, name);
 
         if (!value) {
             PyErr_Format(PyExc_TypeError,
@@ -220,13 +267,27 @@ static PyObject *px_lambda_call(PyObject *self, PyObject *args, PyObject *kwargs
     }
     Py_DECREF(extra_kwargs);
 
-    {
-        PXState state = {PX_NORMAL, 0};
-        PyObject *result = px_eval(n->left, locals, &state);
-        Py_DECREF(locals);
+    PXState state = {PX_NORMAL, 0};
+    PyObject *result = px_eval(n->left, locals, &state);
+    Py_DECREF(locals);
+    if (!result) {
+        if (owns_callable_name) Py_DECREF(callable_name);
+        return NULL;
+    }
+    if (state.flow == PX_RETURN) {
+        state.flow = PX_NORMAL;
         if (owns_callable_name) Py_DECREF(callable_name);
         return result;
     }
+    if (state.flow == PX_BREAK || state.flow == PX_CONTINUE) {
+        Py_DECREF(result);
+        PyErr_Format(PyExc_SyntaxError, "'%s' outside loop", state.flow == PX_BREAK ? "break" : "continue");
+        if (owns_callable_name) Py_DECREF(callable_name);
+        return NULL;
+    }
+    Py_DECREF(result);
+    if (owns_callable_name) Py_DECREF(callable_name);
+    return Py_NewRef(Py_None);
 
 error:
     Py_DECREF(locals);
@@ -235,61 +296,153 @@ error_no_locals:
     return NULL;
 }
 
-static PyMethodDef px_lambda_method = {
-    "lambda", (PyCFunction)(void(*)(void))px_lambda_call, METH_VARARGS | METH_KEYWORDS, NULL
+static PyObject *px_function_get_parent(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    PyXFunctionObject *fn = (PyXFunctionObject *)self;
+    return PyDict_New(); /* Parent is attached by px_function when nested. */
+}
+
+static PyMemberDef px_function_members[] = {
+    {"__name__", T_OBJECT_EX, offsetof(PyXFunctionObject, name), READONLY, NULL},
+    {"__qualname__", T_OBJECT_EX, offsetof(PyXFunctionObject, qualname), READONLY, NULL},
+    {"__module__", T_OBJECT_EX, offsetof(PyXFunctionObject, module), READONLY, NULL},
+    {"__doc__", T_OBJECT_EX, offsetof(PyXFunctionObject, doc), 0, NULL},
+    {"__defaults__", T_OBJECT_EX, offsetof(PyXFunctionObject, defaults), 0, NULL},
+    {"__kwdefaults__", T_OBJECT_EX, offsetof(PyXFunctionObject, kwdefaults), 0, NULL},
+    {"__annotations__", T_OBJECT_EX, offsetof(PyXFunctionObject, annotations), 0, NULL},
+    {NULL}
+};
+
+static PyTypeObject PyXFunction_Type = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "pythonx.function",
+    .tp_basicsize = sizeof(PyXFunctionObject),
+    .tp_dealloc = (destructor)px_function_dealloc,
+    .tp_call = px_function_call,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_members = px_function_members,
+    .tp_doc = "PythonX native function",
+    .tp_new = PyType_GenericNew,
 };
 
 static PyObject *px_function(const PyXIRNode *n, PyObject *g, PXState *s)
 {
-    PyObject *defaults = PyTuple_New(0);
-    PyObject *kwdefaults = PyDict_New();
-    if (!defaults || !kwdefaults) { Py_XDECREF(defaults); Py_XDECREF(kwdefaults); return NULL; }
+    if (PyType_Ready(&PyXFunction_Type) < 0) return NULL;
 
-    Py_ssize_t positional = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 1));
-    Py_ssize_t total_pos = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 0)) + positional;
-    Py_ssize_t nd = n->child_count;
-    Py_ssize_t kwonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 2));
-    Py_ssize_t pos_defaults = nd - kwonly;
-    if (pos_defaults < 0) pos_defaults = 0;
-    if (pos_defaults > total_pos) pos_defaults = total_pos;
-    PyObject *pos = PyTuple_New(pos_defaults);
-    if (!pos) { Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
-
+    PyObject *meta = n->constant;
+    Py_ssize_t positional = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 1));
+    Py_ssize_t total_pos = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 0)) + positional;
+    Py_ssize_t kwonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 2));
+    Py_ssize_t meta_size = PyTuple_GET_SIZE(meta);
+    Py_ssize_t annotation_count = meta_size > 11 ? PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 11)) : 0;
+    Py_ssize_t decorator_count = meta_size > 12 ? PyLong_AsSsize_t(PyTuple_GET_ITEM(meta, 12)) : 0;
     Py_ssize_t nd_total = n->child_count;
-    Py_ssize_t nd_pos = nd_total - kwonly;
-    if (nd_pos < 0) nd_pos = 0;
-    for (Py_ssize_t i = 0; i < nd_pos; ++i) {
-        PyObject *v = px_eval(n->children[i], g, s);
-        if (!v) { Py_DECREF(pos); Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
-        PyTuple_SET_ITEM(pos, i, v);
-    }
-    for (Py_ssize_t i = 0; i < kwonly; ++i) {
-        PyXIRNode *d = n->children[nd_pos + i];
-        if (!d) continue;
-        PyObject *v = px_eval(d, g, s);
-        if (!v) { Py_DECREF(pos); Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
-        PyObject *name = PyTuple_GET_ITEM(PyTuple_GET_ITEM(n->constant, 5), total_pos + i);
-        if (PyDict_SetItem(kwdefaults, name, v) < 0) { Py_DECREF(v); Py_DECREF(pos); Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
-        Py_DECREF(v);
-    }
-    Py_DECREF(defaults);
-    defaults = pos;
-
-    PXLambdaClosure *closure = PyMem_Calloc(1, sizeof(*closure));
-    if (!closure) { Py_DECREF(defaults); Py_DECREF(kwdefaults); PyErr_NoMemory(); return NULL; }
-    closure->node = n; closure->globals = Py_NewRef(g); closure->defaults = defaults; closure->kwdefaults = kwdefaults;
-    PyObject *capsule = PyCapsule_New(closure, "PythonX.lambda", px_lambda_free);
-    if (!capsule) {
-        Py_DECREF(closure->globals);
-        Py_DECREF(closure->defaults);
-        Py_DECREF(closure->kwdefaults);
-        PyMem_Free(closure);
+    Py_ssize_t nd = nd_total - kwonly - annotation_count - decorator_count;
+    if (nd < 0) {
+        PyErr_SetString(PyExc_SystemError, "invalid PythonX function metadata");
         return NULL;
     }
-    PyObject *fn = PyCFunction_NewEx(&px_lambda_method, capsule, NULL);
-    Py_DECREF(capsule);
-    if (!fn) return NULL;
-    return fn;
+
+    PyObject *defaults = PyTuple_New(nd);
+    PyObject *kwdefaults = PyDict_New();
+    PyObject *annotations = PyDict_New();
+    if (!defaults || !kwdefaults || !annotations) {
+        Py_XDECREF(defaults); Py_XDECREF(kwdefaults); Py_XDECREF(annotations);
+        return NULL;
+    }
+
+    Py_ssize_t nd_pos = nd;
+    for (Py_ssize_t i = 0; i < nd_pos; ++i) {
+        PyObject *v = px_eval(n->children[i], g, s);
+        if (!v) goto fail;
+        PyTuple_SET_ITEM(defaults, i, v);
+    }
+
+    for (Py_ssize_t i = 0; i < kwonly; ++i) {
+        PyXIRNode *d = n->children[nd + i];
+        if (!d) continue;
+        PyObject *v = px_eval(d, g, s);
+        if (!v) goto fail;
+        PyObject *name = PyTuple_GET_ITEM(PyTuple_GET_ITEM(meta, 5), total_pos + i);
+        if (PyDict_SetItem(kwdefaults, name, v) < 0) { Py_DECREF(v); goto fail; }
+        Py_DECREF(v);
+    }
+
+    if (annotation_count) {
+        PyObject *names = PyTuple_GET_ITEM(meta, 5);
+        for (Py_ssize_t i = 0; i < annotation_count; ++i) {
+            PyXIRNode *a = n->children[nd + kwonly + i];
+            if (!a) continue;
+            PyObject *v = px_eval(a, g, s);
+            if (!v) goto fail;
+            PyObject *key;
+            if (i < PyTuple_GET_SIZE(names))
+                key = PyTuple_GET_ITEM(names, i);
+            else
+                key = PyUnicode_FromString("return");
+            if (PyDict_SetItem(annotations, key, v) < 0) {
+                Py_DECREF(v);
+                if (i >= PyTuple_GET_SIZE(names)) Py_DECREF(key);
+                goto fail;
+            }
+            Py_DECREF(v);
+            if (i >= PyTuple_GET_SIZE(names)) Py_DECREF(key);
+        }
+    }
+
+    PyObject *name = meta_size > 6 ? PyTuple_GET_ITEM(meta, 6) : PyUnicode_FromString("<lambda>");
+    PyObject *qualname = meta_size > 7 ? PyTuple_GET_ITEM(meta, 7) : name;
+    PyObject *module = meta_size > 8 ? PyTuple_GET_ITEM(meta, 8) : Py_None;
+    PyObject *doc = meta_size > 9 ? PyTuple_GET_ITEM(meta, 9) : Py_None;
+    int is_async = meta_size > 10 && PyObject_IsTrue(PyTuple_GET_ITEM(meta, 10));
+    if (PyErr_Occurred()) goto fail;
+
+    PyXFunctionObject *fn = (PyXFunctionObject *)PyObject_New(PyXFunctionObject, &PyXFunction_Type);
+    if (!fn) goto fail;
+    fn->node = n;
+    fn->globals = Py_NewRef(g);
+    fn->defaults = defaults; defaults = NULL;
+    fn->kwdefaults = kwdefaults; kwdefaults = NULL;
+    fn->annotations = annotations; annotations = NULL;
+    fn->name = Py_NewRef(name);
+    fn->qualname = Py_NewRef(qualname);
+    if (module == Py_None) {
+        PyObject *m = PyDict_GetItemString(g, "__name__");
+        fn->module = m ? Py_NewRef(m) : Py_NewRef(Py_None);
+    } else fn->module = Py_NewRef(module);
+    fn->doc = Py_NewRef(doc);
+    fn->is_async = is_async;
+
+    /*
+     * Apply decorators from bottom to top, exactly as Python does:
+     * @outer
+     * @inner
+     * def f:  => outer(inner(f))
+     */
+    if (decorator_count) {
+        PyObject *decorated = (PyObject *)fn;
+        Py_INCREF(decorated);
+        Py_ssize_t base = nd + kwonly + annotation_count;
+        for (Py_ssize_t i = decorator_count - 1; i >= 0; --i) {
+            PyObject *decorator = px_eval(n->children[base + i], g, s);
+            if (!decorator) { Py_DECREF(decorated); return NULL; }
+            PyObject *next = PyObject_CallOneArg(decorator, decorated);
+            Py_DECREF(decorator);
+            Py_DECREF(decorated);
+            if (!next) return NULL;
+            decorated = next;
+        }
+        Py_DECREF(fn);
+        return decorated;
+    }
+
+    return (PyObject *)fn;
+
+fail:
+    Py_XDECREF(defaults);
+    Py_XDECREF(kwdefaults);
+    Py_XDECREF(annotations);
+    return NULL;
 }
 
 static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
