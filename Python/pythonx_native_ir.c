@@ -2114,7 +2114,7 @@ static PyObject *px_native_int_x86(const PyXIRFunction *f)
     const PyXIRNode *root = f->root;
     const PyXIRNode *expr = NULL;
     long long a, b;
-    unsigned char code[96];
+    unsigned char code[128];
     size_t p = 0;
 
     if (!root || root->op != PYX_IR_SEQUENCE || root->child_count != 1 ||
