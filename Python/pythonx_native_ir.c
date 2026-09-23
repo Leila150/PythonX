@@ -138,12 +138,13 @@ static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
     PyObject *kwdefaults = PyDict_New();
     if (!defaults || !kwdefaults) { Py_XDECREF(defaults); Py_XDECREF(kwdefaults); return NULL; }
 
-    Py_ssize_t nd = PyTuple_GET_SIZE(n->constant) >= 0 ? n->child_count : 0;
     Py_ssize_t positional = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 1));
     Py_ssize_t total_pos = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 0)) + positional;
-    Py_ssize_t pos_defaults = n->child_count;
+    Py_ssize_t nd = n->child_count;
     Py_ssize_t kwonly = PyLong_AsSsize_t(PyTuple_GET_ITEM(n->constant, 2));
-    if (pos_defaults > total_pos) pos_defaults = total_pos - kwonly;
+    Py_ssize_t pos_defaults = nd - kwonly;
+    if (pos_defaults < 0) pos_defaults = 0;
+    if (pos_defaults > total_pos) pos_defaults = total_pos;
     PyObject *pos = PyTuple_New(pos_defaults);
     if (!pos) { Py_DECREF(defaults); Py_DECREF(kwdefaults); return NULL; }
 
@@ -171,7 +172,13 @@ static PyObject *px_lambda(const PyXIRNode *n, PyObject *g, PXState *s)
     if (!closure) { Py_DECREF(defaults); Py_DECREF(kwdefaults); PyErr_NoMemory(); return NULL; }
     closure->node = n; closure->globals = Py_NewRef(g); closure->defaults = defaults; closure->kwdefaults = kwdefaults;
     PyObject *capsule = PyCapsule_New(closure, "PythonX.lambda", px_lambda_free);
-    if (!capsule) { px_lambda_free(PyCapsule_New(closure, "PythonX.lambda", NULL)); return NULL; }
+    if (!capsule) {
+        Py_DECREF(closure->globals);
+        Py_DECREF(closure->defaults);
+        Py_DECREF(closure->kwdefaults);
+        PyMem_Free(closure);
+        return NULL;
+    }
     PyObject *fn = PyCFunction_NewEx(&px_lambda_method, capsule, NULL);
     Py_DECREF(capsule);
     return fn;
@@ -361,14 +368,7 @@ static int px_assign_target(const PyXIRNode *target, PyObject *g, PyObject *valu
     if (target->op == PYX_IR_UNPACK) return px_assign_unpack(target, g, value, s);
     if (target->op == PYX_IR_STAR_UNPACK) return px_assign_target(target->left, g, value, s);
     if (target->op == PYX_IR_NAME_STORE) return PyDict_SetItem(g, target->constant, value);
-    if (target->op == PYX_IR_NAME_LOAD) return PyDict_SetItem(g, target->constant, value);
     if (target->op == PYX_IR_SETATTR) {
-        PyObject *object = px_eval(target->left, g, s);
-        if (!object) return -1;
-        int rc = PyObject_SetAttr(object, target->constant, value);
-        Py_DECREF(object); return rc;
-    }
-    if (target->op == PYX_IR_GETATTR) {
         PyObject *object = px_eval(target->left, g, s);
         if (!object) return -1;
         int rc = PyObject_SetAttr(object, target->constant, value);
@@ -787,6 +787,73 @@ static PyObject *px_eval(const PyXIRNode *n, PyObject *g, PXState *s)
         }
         Py_DECREF(left);
         return Py_NewRef(Py_True);
+    }
+    case PYX_IR_STARRED:
+        return px_eval(n->left, g, s);
+    case PYX_IR_DICT_UNPACK:
+        return px_eval(n->left ? n->left : (n->child_count ? n->children[0] : NULL), g, s);
+    case PYX_IR_ATTRIBUTE: {
+        PyObject *object = px_eval(n->left, g, s);
+        if (!object) return NULL;
+        PyObject *result = PyObject_GetAttr(object, n->constant);
+        Py_DECREF(object);
+        return result;
+    }
+    case PYX_IR_TYPE_OF: {
+        PyObject *object = px_eval(n->left ? n->left : (n->child_count ? n->children[0] : NULL), g, s);
+        if (!object) return NULL;
+        PyObject *result = (PyObject *)Py_TYPE(object);
+        Py_INCREF(result);
+        Py_DECREF(object);
+        return result;
+    }
+    case PYX_IR_INSTANCE_OF: {
+        PyObject *object = px_eval(n->children[0], g, s);
+        PyObject *type = px_eval(n->children[1], g, s);
+        if (!object || !type) { Py_XDECREF(object); Py_XDECREF(type); return NULL; }
+        int ok = PyObject_IsInstance(object, type);
+        Py_DECREF(object); Py_DECREF(type);
+        if (ok < 0) return NULL;
+        return PyBool_FromLong(ok);
+    }
+    case PYX_IR_SUBCLASS_OF: {
+        PyObject *derived = px_eval(n->children[0], g, s);
+        PyObject *base = px_eval(n->children[1], g, s);
+        if (!derived || !base) { Py_XDECREF(derived); Py_XDECREF(base); return NULL; }
+        int ok = PyObject_IsSubclass(derived, base);
+        Py_DECREF(derived); Py_DECREF(base);
+        if (ok < 0) return NULL;
+        return PyBool_FromLong(ok);
+    }
+    case PYX_IR_HASH: {
+        PyObject *object = px_eval(n->left ? n->left : (n->child_count ? n->children[0] : NULL), g, s);
+        if (!object) return NULL;
+        Py_hash_t hash = PyObject_Hash(object);
+        Py_DECREF(object);
+        if (hash == -1 && PyErr_Occurred()) return NULL;
+        return PyLong_FromSsize_t(hash);
+    }
+    case PYX_IR_ITER: {
+        PyObject *object = px_eval(n->left ? n->left : (n->child_count ? n->children[0] : NULL), g, s);
+        if (!object) return NULL;
+        PyObject *result = PyObject_GetIter(object);
+        Py_DECREF(object);
+        return result;
+    }
+    case PYX_IR_NEXT: {
+        PyObject *iterator = px_eval(n->children[0], g, s);
+        if (!iterator) return NULL;
+        PyObject *result = PyIter_Next(iterator);
+        if (result) { Py_DECREF(iterator); return result; }
+        if (PyErr_Occurred()) { Py_DECREF(iterator); return NULL; }
+        if (n->child_count > 1) {
+            result = px_eval(n->children[1], g, s);
+            Py_DECREF(iterator);
+            return result;
+        }
+        Py_DECREF(iterator);
+        PyErr_SetNone(PyExc_StopIteration);
+        return NULL;
     }
     case PYX_IR_LAMBDA:return px_lambda(n,g,s);
 
