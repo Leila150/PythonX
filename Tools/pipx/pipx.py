@@ -238,6 +238,11 @@ def check_os_compatibility(info: dict[str, Any], filename: str, wheel_metadata: 
     OS-independent distribution is unavailable.
     """
     project = info.get("info", {})
+    wheel_metadata = wheel_metadata or {}
+    if wheel_metadata.get("PythonX-OS-Unsupported", "").strip().lower() in {"1", "true", "yes"}:
+        raise RuntimeError(
+            f"PythonX pipx: {project.get("name", "package")} declares PythonX-OS support as unavailable."
+        )
     classifiers = project.get("classifiers", []) or []
     description = str(project.get("description", "") or "").lower()
 
@@ -273,8 +278,12 @@ def install_package(name: str, requested_version: str | None, os_build: bool) ->
     canonical = project.get("name", name)
     distribution = choose_distribution(data, requested_version)
 
-    if os_build:
-        check_os_compatibility(data, distribution["filename"])
+    if os_build and distribution["packagetype"] == "bdist_wheel":
+        # Read package metadata before extraction so -os can reject it before installation.
+        with tempfile.TemporaryDirectory(prefix="pythonx-pipx-check-") as check_tmp:
+            check_archive = Path(check_tmp) / distribution["filename"]
+            download(distribution["url"], check_archive)
+            check_os_compatibility(data, distribution["filename"], read_wheel_metadata(check_archive))
 
     target = installed_path(canonical)
     target.parent.mkdir(parents=True, exist_ok=True)
