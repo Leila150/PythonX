@@ -1938,7 +1938,7 @@ PyObject *_PyX_NativeExecuteIR(PyObject*code){
     return((XIRNativeFunction)n->code)();
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#elif defined(__x86_64__) || defined(_M_X64)
 typedef struct { unsigned char *code; size_t size; PyXIRNode *root; PyObject *globals; } XIRNativeCode;
 typedef PyObject *(*XIRNativeFunction)(void);
 static void *alloc_exec(size_t size){
