@@ -23,11 +23,13 @@ import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+import urllib.parse
 import zipfile
 from pathlib import Path
 from typing import Any
 
 PYPI = "https://pypi.org/pypi"
+PYPI_SIMPLE = "https://pypi.org/simple/"
 DEFAULT_HOME = Path.home() / ".pythonx"
 
 WHEEL_RE = re.compile(
@@ -294,8 +296,60 @@ def copy_tree_contents(source: Path, destination: Path) -> None:
             shutil.copy2(item, target)
 
 
-def install_package(name: str, requested_version: str | None, os_build: bool) -> None:
-    data = fetch_json(f"{PYPI}/{name}/json")
+
+def package_json(name: str, index_url: str | None = None) -> dict[str, Any]:
+    if not index_url or index_url.rstrip("/") == PYPI_SIMPLE.rstrip("/"):
+        return fetch_json(f"{PYPI}/{urllib.parse.quote(name, safe='')}/json")
+    base = index_url.rstrip("/")
+    if base.endswith("/simple"):
+        json_url = base[:-7] + f"/pypi/{urllib.parse.quote(name, safe='')}/json"
+    else:
+        json_url = base + f"/pypi/{urllib.parse.quote(name, safe='')}/json"
+    return fetch_json(json_url)
+
+
+def package_data(name: str, indexes_list: list[str]) -> tuple[dict[str, Any], str]:
+    errors = []
+    for index in indexes_list:
+        try:
+            return package_json(name, index), index
+        except Exception as exc:
+            errors.append(f"{index}: {exc}")
+    raise RuntimeError(
+        f"PythonX pipx: package {name!r} was not found in configured indexes. "
+        + " | ".join(errors)
+    )
+
+
+def requirement_parts(requirement: str) -> tuple[str, list[tuple[str, str]]]:
+    requirement = requirement.split(";", 1)[0].strip()
+    match = re.match(r"^([A-Za-z0-9_.-]+)\s*(.*)$", requirement)
+    if not match:
+        raise RuntimeError(f"PythonX pipx: unsupported dependency: {requirement}")
+    name, spec = match.groups()
+    return name, re.findall(r"(===|==|!=|>=|<=|>|<|~=)\s*([A-Za-z0-9_.+!-]+)", spec)
+
+
+def version_satisfies(version: str, constraints: list[tuple[str, str]]) -> bool:
+    for op, wanted in constraints:
+        a, b = version_key(version), version_key(wanted)
+        if op == "==" and a != b: return False
+        if op == "===" and version != wanted: return False
+        if op == "!=" and a == b: return False
+        if op == ">=" and a < b: return False
+        if op == "<=" and a > b: return False
+        if op == ">" and a <= b: return False
+        if op == "<" and a >= b: return False
+    return True
+
+
+def install_package(name: str, requested_version: str | None, os_build: bool, indexes_list: list[str] | None = None, no_deps: bool = False, seen: set[str] | None = None) -> None:
+    indexes_list = indexes_list or [PYPI_SIMPLE]
+    seen = seen or set()
+    if normalize(name) in seen:
+        return
+    seen.add(normalize(name))
+    data, source_index = package_data(name, indexes_list)
     project = data.get("info", {})
     canonical = project.get("name", name)
     distribution = choose_distribution(data, requested_version)
@@ -366,16 +420,27 @@ def install_package(name: str, requested_version: str | None, os_build: bool) ->
         json.dumps(meta, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+    if not no_deps:
+        for requirement in meta.get("requires_dist", []):
+            dep_name, constraints = requirement_parts(requirement)
+            dep_meta_file = metadata_path(dep_name)
+            if dep_meta_file.exists():
+                installed = load_metadata(dep_name)
+                if version_satisfies(installed.get("version", ""), constraints):
+                    continue
+            install_package(dep_name, None, os_build, indexes_list, False, seen)
+
     print(f"pipx: installed {canonical} into {target}")
     if os_build:
         print("pipx: marked for PythonX OS build.")
 
 
-def update_package(name: str, requested_version: str | None, os_build: bool | None) -> None:
+def update_package(name: str, requested_version: str | None, os_build: bool | None, indexes_list: list[str] | None = None, no_deps: bool = False) -> None:
     old = load_metadata(name)
     use_os = bool(old.get("os_build", False)) if os_build is None else os_build
     print(f"pipx: updating {old['name']}...")
-    install_package(old["name"], requested_version, use_os)
+    install_package(old["name"], requested_version, use_os, indexes_list, no_deps)
 
 
 def reinstall_package(name: str) -> None:
@@ -451,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
     install = sub.add_parser("install", help="Install PythonX or a third-party package.")
     install.add_argument("package")
     install.add_argument("--version", "-v", dest="version")
+    install.add_argument("--index-url", dest="index_url")
+    install.add_argument("--extra-index-url", action="append", default=[])
+    install.add_argument("--no-deps", action="store_true")
     install.add_argument(
         "-os", "--os", action="store_true", dest="os_build",
         help="Install for a PythonX OS build; reject host-OS-dependent packages.",
@@ -459,6 +527,9 @@ def main(argv: list[str] | None = None) -> int:
     update = sub.add_parser("update", aliases=["upgrade"], help="Update an installed package.")
     update.add_argument("package", nargs="?")
     update.add_argument("--version", "-v", dest="version")
+    update.add_argument("--index-url", dest="index_url")
+    update.add_argument("--extra-index-url", action="append", default=[])
+    update.add_argument("--no-deps", action="store_true")
     update.add_argument("-os", "--os", action="store_true", dest="os_build")
     update.add_argument("--no-os", action="store_false", dest="os_build")
     update.add_argument("--all", action="store_true", dest="all_packages")
@@ -491,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "install":
-            install_package(args.package, args.version, args.os_build)
+            install_package(args.package, args.version, args.os_build, [args.index_url] + args.extra_index_url if args.index_url else args.extra_index_url, args.no_deps)
         elif args.command in {"update", "upgrade"}:
             if args.all_packages:
                 for package in installed_names():
